@@ -1,2 +1,13 @@
-python-telegram-bot[job-queue]>=20.0
-aiohttp>=3.8.0
+# Create requirements.txt
+echo "python-telegram-bot[job-queue]>=20.0" > requirements.txt
+echo "aiohttp>=3.8.0" >> requirements.txt
+echo "openpyxl>=3.0.0" >> requirements.txt
+echo "pandas>=2.0.0" >> requirements.txt
+
+# Verify the file exists
+ls -la requirements.txt
+
+# Git commit and push
+git add requirements.txt
+git commit -m "Add requirements.txt for Render"
+git push
