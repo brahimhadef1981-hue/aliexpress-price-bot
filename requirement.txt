@@ -1,23 +1,2 @@
-# Telegram Bot Framework - WITH Job Queue Support (for scheduled monitoring)
 python-telegram-bot[job-queue]>=20.0
-
-# Async HTTP client for making API requests to AliExpress
 aiohttp>=3.8.0
-
-# Data manipulation (if you use pandas for processing)
-pandas>=2.0.0
-
-# Excel file handling (TEMPORARY - you'll need to replace with database)
-openpyxl>=3.0.0
-
-# Async support (usually included with Python 3.7+)
-asyncio>=3.4.3
-
-# For API signature generation (used in your AliExpressAPI class)
-hmac; hashlib  # These are standard Python libraries
-
-# For date/time handling
-python-dateutil>=2.8.2
-
-# For URL parsing
-urllib3>=1.26.0
