@@ -7,12 +7,9 @@ import hmac
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from urllib.parse import urlparse
 import threading
-from flask import Flask, request, Response
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2 import pool
+from flask import Flask, Response
+import asyncpg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -40,7 +37,6 @@ CONCURRENT_REQUESTS = 10
 REQUEST_DELAY = 1
 MONITORING_INTERVAL = 300
 PRODUCTS_PER_CYCLE = 100
-MAX_CHECK_INTERVAL_HOURS = 24
 RATE_LIMIT_RETRY_DELAY = 30
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 15
@@ -63,37 +59,35 @@ def health():
     return Response("OK", status=200)
 
 # ============================================================================
-# DATABASE MANAGER - REPLACES EXCEL WITH POSTGRESQL
+# ASYNC DATABASE MANAGER - USES ASYNCPG
 # ============================================================================
 class DatabaseManager:
     _pool = None
     
     @classmethod
-    def get_pool(cls):
+    async def get_pool(cls):
         if cls._pool is None:
-            cls._pool = pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=10,
-                dsn=DATABASE_URL
+            cls._pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                command_timeout=60
             )
         return cls._pool
     
     @classmethod
-    def get_connection(cls):
-        return cls.get_pool().getconn()
-    
-    @classmethod
-    def release_connection(cls, conn):
-        cls.get_pool().putconn(conn)
+    async def close_pool(cls):
+        if cls._pool:
+            await cls._pool.close()
     
     @staticmethod
-    def init_database():
+    async def init_database():
         """Initialize database tables"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
+            async with pool.acquire() as conn:
                 # Users table
-                cur.execute("""
+                await conn.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id BIGINT PRIMARY KEY,
                         username VARCHAR(255),
@@ -106,7 +100,7 @@ class DatabaseManager:
                 """)
                 
                 # Products table
-                cur.execute("""
+                await conn.execute("""
                     CREATE TABLE IF NOT EXISTS products (
                         id SERIAL PRIMARY KEY,
                         user_id BIGINT,
@@ -125,7 +119,7 @@ class DatabaseManager:
                 """)
                 
                 # Price history table
-                cur.execute("""
+                await conn.execute("""
                     CREATE TABLE IF NOT EXISTS price_history (
                         id SERIAL PRIMARY KEY,
                         user_id BIGINT,
@@ -140,83 +134,68 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Create indexes for better performance
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_last_checked ON products(last_checked)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_history_user_product ON price_history(user_id, product_id)")
+                # Create indexes
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_products_last_checked ON products(last_checked)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user_product ON price_history(user_id, product_id)")
                 
-                conn.commit()
                 print("✅ Database tables initialized")
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error initializing database: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
+            raise
 
     @staticmethod
-    def save_user(user_id: int, username: str, country: str):
+    async def save_user(user_id: int, username: str, country: str):
         """Save or update user"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                await conn.execute("""
                     INSERT INTO users (user_id, username, country)
-                    VALUES (%s, %s, %s)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT (user_id) 
                     DO UPDATE SET country = EXCLUDED.country, username = EXCLUDED.username
-                """, (user_id, username, country))
-                conn.commit()
+                """, user_id, username, country)
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error saving user: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_user_country(user_id: int) -> Optional[str]:
+    async def get_user_country(user_id: int) -> Optional[str]:
         """Get user's current country"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT country FROM users WHERE user_id = %s", (user_id,))
-                result = cur.fetchone()
-                return result[0] if result else None
+            async with pool.acquire() as conn:
+                result = await conn.fetchval("SELECT country FROM users WHERE user_id = $1", user_id)
+                return result
         except Exception as e:
             print(f"❌ Error getting user country: {e}")
             return None
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def update_user_products_country(user_id: int, new_country: str) -> int:
+    async def update_user_products_country(user_id: int, new_country: str) -> int:
         """Update country for all products of a user"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE products SET country = %s WHERE user_id = %s
-                """, (new_country, user_id))
-                updated = cur.rowcount
-                conn.commit()
-                return updated
+            async with pool.acquire() as conn:
+                result = await conn.execute("""
+                    UPDATE products SET country = $1 WHERE user_id = $2
+                """, new_country, user_id)
+                return int(result.split()[-1])
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error updating products country: {e}")
             return 0
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def save_product(user_id: int, product_id: str, product_url: str, title: str,
-                    price: float, original_price: float, currency: str, image_url: str, country: str):
+    async def save_product(user_id: int, product_id: str, product_url: str, title: str,
+                          price: float, original_price: float, currency: str, image_url: str, country: str):
         """Save product to database"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                await conn.execute("""
                     INSERT INTO products (user_id, product_id, product_url, title, current_price,
                                          original_price, currency, image_url, country, last_checked)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
                     ON CONFLICT (user_id, product_id) 
                     DO UPDATE SET 
                         product_url = EXCLUDED.product_url,
@@ -224,185 +203,161 @@ class DatabaseManager:
                         original_price = EXCLUDED.original_price,
                         country = EXCLUDED.country,
                         last_checked = CURRENT_TIMESTAMP
-                """, (user_id, product_id, product_url, title, price, original_price, 
-                      currency, image_url, country))
-                conn.commit()
+                """, user_id, product_id, product_url, title, price, original_price, 
+                    currency, image_url, country)
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error saving product: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_all_products() -> List[Dict]:
+    async def get_all_products() -> List[Dict]:
         """Get all products for monitoring"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
                     SELECT user_id, product_id, product_url, title, current_price,
                            original_price, currency, image_url, country, date_added, last_checked
                     FROM products
                 """)
-                return [dict(row) for row in cur.fetchall()]
+                return [dict(row) for row in rows]
         except Exception as e:
             print(f"❌ Error getting products: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_products_to_check(limit: int) -> List[Dict]:
-        """Get products that need to be checked, ordered by last_checked"""
-        conn = DatabaseManager.get_connection()
+    async def get_products_to_check(limit: int) -> List[Dict]:
+        """Get products that need to be checked"""
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
                     SELECT user_id, product_id, product_url, title, current_price,
                            original_price, currency, image_url, country, date_added, last_checked
                     FROM products
                     ORDER BY last_checked ASC NULLS FIRST
-                    LIMIT %s
-                """, (limit,))
-                return [dict(row) for row in cur.fetchall()]
+                    LIMIT $1
+                """, limit)
+                return [dict(row) for row in rows]
         except Exception as e:
             print(f"❌ Error getting products to check: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def update_product_price(user_id: int, product_id: str, new_price: float, 
-                            country: str = None, product_url: str = None):
+    async def update_product_price(user_id: int, product_id: str, new_price: float, 
+                                   country: str = None, product_url: str = None):
         """Update product price and last checked time"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
+            async with pool.acquire() as conn:
                 if product_url and country:
-                    cur.execute("""
+                    await conn.execute("""
                         UPDATE products 
-                        SET current_price = %s, country = %s, product_url = %s, last_checked = CURRENT_TIMESTAMP
-                        WHERE user_id = %s AND product_id = %s
-                    """, (new_price, country, product_url, user_id, product_id))
+                        SET current_price = $1, country = $2, product_url = $3, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = $4 AND product_id = $5
+                    """, new_price, country, product_url, user_id, product_id)
                 elif country:
-                    cur.execute("""
+                    await conn.execute("""
                         UPDATE products 
-                        SET current_price = %s, country = %s, last_checked = CURRENT_TIMESTAMP
-                        WHERE user_id = %s AND product_id = %s
-                    """, (new_price, country, user_id, product_id))
+                        SET current_price = $1, country = $2, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = $3 AND product_id = $4
+                    """, new_price, country, user_id, product_id)
                 else:
-                    cur.execute("""
+                    await conn.execute("""
                         UPDATE products 
-                        SET current_price = %s, last_checked = CURRENT_TIMESTAMP
-                        WHERE user_id = %s AND product_id = %s
-                    """, (new_price, user_id, product_id))
-                conn.commit()
+                        SET current_price = $1, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = $2 AND product_id = $3
+                    """, new_price, user_id, product_id)
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error updating product price: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def save_price_change(user_id: int, product_id: str, title: str, old_price: float,
-                         new_price: float, currency: str):
+    async def save_price_change(user_id: int, product_id: str, title: str, old_price: float,
+                                new_price: float, currency: str):
         """Save price change to history"""
         if abs(new_price - old_price) < 0.01:
             return
         
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
             change = new_price - old_price
             change_percent = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0
             
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                await conn.execute("""
                     INSERT INTO price_history (user_id, product_id, product_title, old_price,
                                               new_price, change_amount, change_percent, currency)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (user_id, product_id, title, old_price, new_price, 
-                      round(change, 2), round(change_percent, 2), currency))
-                conn.commit()
-                print(f"✅ Price change archived: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """, user_id, product_id, title, old_price, new_price, 
+                    round(change, 2), round(change_percent, 2), currency)
+                print(f"✅ Price change archived: {title[:30]} - ${change:+.2f} ({change_percent:+.1f}%)")
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error saving price change: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_user_products(user_id: int) -> List[Dict]:
+    async def get_user_products(user_id: int) -> List[Dict]:
         """Get all products for a specific user"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
                     SELECT user_id, product_id, product_url, title, current_price,
                            original_price, currency, image_url, country, date_added, last_checked
-                    FROM products WHERE user_id = %s
-                """, (user_id,))
-                return [dict(row) for row in cur.fetchall()]
+                    FROM products WHERE user_id = $1
+                """, user_id)
+                return [dict(row) for row in rows]
         except Exception as e:
             print(f"❌ Error getting user products: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def delete_product(user_id: int, product_id: str) -> bool:
+    async def delete_product(user_id: int, product_id: str) -> bool:
         """Delete a product from monitoring"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM products WHERE user_id = %s AND product_id = %s", 
-                           (user_id, product_id))
-                conn.commit()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM products WHERE user_id = $1 AND product_id = $2", 
+                                  user_id, product_id)
                 return True
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error deleting product: {e}")
             return False
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_price_history(user_id: int, product_id: str, months: int = None) -> List[Dict]:
+    async def get_price_history(user_id: int, product_id: str, months: int = None) -> List[Dict]:
         """Get price history for a product"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            async with pool.acquire() as conn:
                 if months:
-                    cur.execute("""
+                    rows = await conn.fetch("""
                         SELECT product_title as title, old_price, new_price, change_amount,
                                change_percent, currency, date_recorded as date
                         FROM price_history
-                        WHERE user_id = %s AND product_id = %s
+                        WHERE user_id = $1 AND product_id = $2
                         AND date_recorded >= CURRENT_TIMESTAMP - INTERVAL '%s months'
                         ORDER BY date_recorded DESC
-                    """, (user_id, product_id, months))
+                    """ % months, user_id, product_id)
                 else:
-                    cur.execute("""
+                    rows = await conn.fetch("""
                         SELECT product_title as title, old_price, new_price, change_amount,
                                change_percent, currency, date_recorded as date
                         FROM price_history
-                        WHERE user_id = %s AND product_id = %s
+                        WHERE user_id = $1 AND product_id = $2
                         ORDER BY date_recorded DESC
-                    """, (user_id, product_id))
-                return [dict(row) for row in cur.fetchall()]
+                    """, user_id, product_id)
+                return [dict(row) for row in rows]
         except Exception as e:
             print(f"❌ Error getting price history: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_all_user_price_history(user_id: int, months: int = None) -> Dict[str, List[Dict]]:
+    async def get_all_user_price_history(user_id: int, months: int = None) -> Dict[str, Any]:
         """Get price history for all products of a user"""
-        products = DatabaseManager.get_user_products(user_id)
+        products = await DatabaseManager.get_user_products(user_id)
         history_by_product = {}
         
         for product in products:
-            history = DatabaseManager.get_price_history(user_id, product['product_id'], months)
+            history = await DatabaseManager.get_price_history(user_id, product['product_id'], months)
             if history:
                 history_by_product[product['product_id']] = {
                     'product': product,
@@ -412,99 +367,83 @@ class DatabaseManager:
         return history_by_product
 
     @staticmethod
-    def set_update_reminder(user_id: int):
+    async def set_update_reminder(user_id: int):
         """Set monthly update reminder for user"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
             deadline = datetime.now() + timedelta(days=UPDATE_RESPONSE_DEADLINE_DAYS)
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                await conn.execute("""
                     UPDATE users 
                     SET last_update_reminder = CURRENT_TIMESTAMP,
-                        update_deadline = %s,
+                        update_deadline = $1,
                         needs_update_response = TRUE
-                    WHERE user_id = %s
-                """, (deadline, user_id))
-                conn.commit()
+                    WHERE user_id = $2
+                """, deadline, user_id)
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error setting update reminder: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def clear_update_reminder(user_id: int):
+    async def clear_update_reminder(user_id: int):
         """Clear update reminder after user responds"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                await conn.execute("""
                     UPDATE users 
                     SET last_update_reminder = CURRENT_TIMESTAMP,
                         update_deadline = NULL,
                         needs_update_response = FALSE
-                    WHERE user_id = %s
-                """, (user_id,))
-                conn.commit()
+                    WHERE user_id = $1
+                """, user_id)
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error clearing update reminder: {e}")
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_users_needing_reminder() -> List[int]:
+    async def get_users_needing_reminder() -> List[int]:
         """Get users who need monthly update reminder"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
                     SELECT user_id FROM users
                     WHERE last_update_reminder IS NULL
                     OR last_update_reminder < CURRENT_TIMESTAMP - INTERVAL '%s days'
-                """, (MONTHLY_UPDATE_REMINDER_DAYS,))
-                return [row[0] for row in cur.fetchall()]
+                """ % MONTHLY_UPDATE_REMINDER_DAYS)
+                return [row['user_id'] for row in rows]
         except Exception as e:
             print(f"❌ Error getting users needing reminder: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def get_users_past_deadline() -> List[int]:
+    async def get_users_past_deadline() -> List[int]:
         """Get users who didn't respond and are past deadline"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
                     SELECT user_id FROM users
                     WHERE needs_update_response = TRUE
                     AND update_deadline < CURRENT_TIMESTAMP
                 """)
-                return [row[0] for row in cur.fetchall()]
+                return [row['user_id'] for row in rows]
         except Exception as e:
             print(f"❌ Error getting users past deadline: {e}")
             return []
-        finally:
-            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def delete_all_user_data(user_id: int):
+    async def delete_all_user_data(user_id: int):
         """Delete all products and price history for a user"""
-        conn = DatabaseManager.get_connection()
+        pool = await DatabaseManager.get_pool()
         try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM products WHERE user_id = %s", (user_id,))
-                cur.execute("DELETE FROM price_history WHERE user_id = %s", (user_id,))
-                conn.commit()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM products WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM price_history WHERE user_id = $1", user_id)
                 print(f"✅ Deleted all data for user {user_id}")
                 return True
         except Exception as e:
-            conn.rollback()
             print(f"❌ Error deleting user data: {e}")
             return False
-        finally:
-            DatabaseManager.release_connection(conn)
 
 # ============================================================================
 # ASYNC ALIEXPRESS API CLIENT
@@ -722,8 +661,8 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = query.data.split("_")[1]
     user = update.effective_user
     
-    DatabaseManager.save_user(user.id, user.username or user.first_name, country)
-    updated_count = DatabaseManager.update_user_products_country(user.id, country)
+    await DatabaseManager.save_user(user.id, user.username or user.first_name, country)
+    updated_count = await DatabaseManager.update_user_products_country(user.id, country)
     context.user_data['country'] = country
     
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
@@ -791,7 +730,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTERING_LINK
     
     processing_msg = await update.message.reply_text("⏳ Processing...")
-    country = DatabaseManager.get_user_country(user_id) or "US"
+    country = await DatabaseManager.get_user_country(user_id) or "US"
     api = await get_api_instance()
     
     if api.is_shortened_url(product_url):
@@ -829,7 +768,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     affiliate_link = await api.generate_affiliate_link(result['product_url'], country)
     
-    DatabaseManager.save_product(
+    await DatabaseManager.save_product(
         user_id=user_id, product_id=product_id, product_url=affiliate_link,
         title=result['title'], price=result['price'], original_price=result['original_price'],
         currency=result['currency'], image_url=result['image_url'], country=country
@@ -883,7 +822,7 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     
     user_id = update.effective_user.id
-    products = DatabaseManager.get_user_products(user_id)
+    products = await DatabaseManager.get_user_products(user_id)
     
     if not products:
         keyboard = [
@@ -900,7 +839,7 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"📦 <b>Your Monitored Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for i, product in enumerate(products[:5], 1):
-        title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
+        title = product['title'][:40] + "..." if len(str(product['title'])) > 40 else product['title']
         message += f"{i}. <b>{title}</b>\n   💵 ${float(product['current_price']):.2f}\n   🌍 {product['country']}\n\n"
     
     if len(products) > 5:
@@ -923,13 +862,13 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = update.effective_user.id
-    products = DatabaseManager.get_user_products(user_id)
+    products = await DatabaseManager.get_user_products(user_id)
     
     message = f"🗑️ <b>Manage Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\nSelect a product to delete:\n\n"
     
     keyboard = []
     for product in products:
-        title = product['title'][:30] + "..." if len(product['title']) > 30 else product['title']
+        title = product['title'][:30] + "..." if len(str(product['title'])) > 30 else product['title']
         keyboard.append([InlineKeyboardButton(
             f"❌ {title} - ${float(product['current_price']):.2f}",
             callback_data=f"delete_{product['product_id']}"
@@ -947,10 +886,10 @@ async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_
     product_id = query.data.split("_", 1)[1]
     user_id = update.effective_user.id
     
-    products = DatabaseManager.get_user_products(user_id)
+    products = await DatabaseManager.get_user_products(user_id)
     product_title = next((p['title'][:50] for p in products if p['product_id'] == product_id), "Product")
     
-    success = DatabaseManager.delete_product(user_id, product_id)
+    success = await DatabaseManager.delete_product(user_id, product_id)
     
     if success:
         keyboard = [
@@ -997,7 +936,7 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
     period = query.data.split("_")[1]
     months = None if period == "all" else int(period)
     
-    history_data = DatabaseManager.get_all_user_price_history(user_id, months)
+    history_data = await DatabaseManager.get_all_user_price_history(user_id, months)
     
     if not history_data:
         keyboard = [
@@ -1017,7 +956,7 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
         history = data['history']
         total_changes += len(history)
         
-        title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
+        title = str(product['title'])[:40] + "..." if len(str(product['title'])) > 40 else product['title']
         message += f"📦 <b>{title}</b>\n"
         
         for change in history[:3]:
@@ -1047,8 +986,8 @@ async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     user_id = update.effective_user.id
-    DatabaseManager.clear_update_reminder(user_id)
-    products = DatabaseManager.get_user_products(user_id)
+    await DatabaseManager.clear_update_reminder(user_id)
+    products = await DatabaseManager.get_user_products(user_id)
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
@@ -1068,8 +1007,8 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = update.effective_user.id
-    country = DatabaseManager.get_user_country(user_id) or "US"
-    products = DatabaseManager.get_user_products(user_id)
+    country = await DatabaseManager.get_user_country(user_id) or "US"
+    products = await DatabaseManager.get_user_products(user_id)
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
     
     message = (
@@ -1119,24 +1058,24 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
     start_time = time.time()
     
     try:
-        user_country = DatabaseManager.get_user_country(product['user_id']) or product['country']
+        user_country = await DatabaseManager.get_user_country(product['user_id']) or product['country']
         result = await api.get_product_details(product['product_id'], user_country)
         api_time = result.get('time_taken', 0)
         
         if not result.get("success"):
-            DatabaseManager.update_product_price(product['user_id'], product['product_id'], float(product['current_price']), user_country)
+            await DatabaseManager.update_product_price(product['user_id'], product['product_id'], float(product['current_price']), user_country)
             print(f"   ❌ {product['product_id']}: {result.get('error')} (⏱️ {api_time:.2f}s)")
             return {'success': False, 'product_id': product['product_id'], 'error': result.get('error'), 'time_taken': time.time() - start_time}
         
         new_price = result['price']
         old_price = float(product['current_price'])
         
-        DatabaseManager.update_product_price(product['user_id'], product['product_id'], new_price, user_country, result['product_url'])
+        await DatabaseManager.update_product_price(product['user_id'], product['product_id'], new_price, user_country, result['product_url'])
         
         price_changed = abs(new_price - old_price) > 0.01
         
         if price_changed:
-            DatabaseManager.save_price_change(product['user_id'], product['product_id'], product['title'], old_price, new_price, product['currency'])
+            await DatabaseManager.save_price_change(product['user_id'], product['product_id'], product['title'], old_price, new_price, product['currency'])
             
             change = new_price - old_price
             change_percent = (change / old_price * 100) if old_price > 0 else 0
@@ -1182,7 +1121,7 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n{'='*70}\n🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*70}")
     
     cycle_start = time.time()
-    products_to_check = DatabaseManager.get_products_to_check(PRODUCTS_PER_CYCLE)
+    products_to_check = await DatabaseManager.get_products_to_check(PRODUCTS_PER_CYCLE)
     
     if not products_to_check:
         print("⚠️ No products to check")
@@ -1219,11 +1158,11 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
 async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    users_need_reminder = DatabaseManager.get_users_needing_reminder()
+    users_need_reminder = await DatabaseManager.get_users_needing_reminder()
     for user_id in users_need_reminder:
-        products = DatabaseManager.get_user_products(user_id)
+        products = await DatabaseManager.get_user_products(user_id)
         if products:
-            DatabaseManager.set_update_reminder(user_id)
+            await DatabaseManager.set_update_reminder(user_id)
             try:
                 keyboard = [
                     [InlineKeyboardButton("✅ Continue Monitoring", callback_data="update_continue")],
@@ -1239,13 +1178,13 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
                 print(f"   ❌ Reminder failed for {user_id}: {e}")
             await asyncio.sleep(2)
     
-    users_past_deadline = DatabaseManager.get_users_past_deadline()
+    users_past_deadline = await DatabaseManager.get_users_past_deadline()
     for user_id in users_past_deadline:
         try:
             await context.bot.send_message(chat_id=user_id, text="⚠️ <b>Products Removed</b>\n\nUse /start to begin again.", parse_mode='HTML')
         except: pass
-        DatabaseManager.delete_all_user_data(user_id)
-        DatabaseManager.clear_update_reminder(user_id)
+        await DatabaseManager.delete_all_user_data(user_id)
+        await DatabaseManager.clear_update_reminder(user_id)
 
 # ============================================================================
 # MAIN FUNCTION
@@ -1253,6 +1192,11 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
 def run_flask():
     """Run Flask server for health checks"""
     flask_app.run(host='0.0.0.0', port=PORT, threaded=True)
+
+async def post_init(application: Application):
+    """Initialize database after application starts"""
+    await DatabaseManager.init_database()
+    print("✅ Database initialized")
 
 def main():
     print(f"\n{'='*70}")
@@ -1264,16 +1208,13 @@ def main():
     print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
     print(f"{'='*70}\n")
     
-    # Initialize database
-    DatabaseManager.init_database()
-    
     # Start Flask in background thread for health checks
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"✅ Health check server started on port {PORT}")
     
     # Build Telegram application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -1309,8 +1250,8 @@ def main():
     
     # Job queue for monitoring
     job_queue = application.job_queue
-    job_queue.run_repeating(monitor_prices, interval=MONITORING_INTERVAL, first=10)
-    job_queue.run_repeating(check_monthly_updates, interval=MONTHLY_CHECK_INTERVAL, first=60)
+    job_queue.run_repeating(monitor_prices, interval=MONITORING_INTERVAL, first=30)
+    job_queue.run_repeating(check_monthly_updates, interval=MONTHLY_CHECK_INTERVAL, first=120)
     
     print("✅ BOT STARTED SUCCESSFULLY!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -1322,3 +1263,5 @@ if __name__ == '__main__':
         print("\n⛔ Bot stopped")
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
