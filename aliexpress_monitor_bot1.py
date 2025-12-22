@@ -20,7 +20,15 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
+import logging
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
@@ -35,22 +43,25 @@ USERS_FILE = "users.xlsx"
 PRODUCTS_FILE = "products.xlsx"
 PRICE_HISTORY_FILE = "price_history.xlsx"
 
-# Monitoring configuration - OPTIMIZED FOR SPEED
-CONCURRENT_REQUESTS = 10  # Process 10 products at the same time
-REQUEST_DELAY = 1  # Only 1 second delay between batches
-MONITORING_INTERVAL = 300  # Check every 5 minutes (reduced from 10)
-PRODUCTS_PER_CYCLE = 100  # Check more products per cycle
+# Monitoring configuration
+CONCURRENT_REQUESTS = 10
+REQUEST_DELAY = 1
+MONITORING_INTERVAL = 300
+PRODUCTS_PER_CYCLE = 100
 MAX_CHECK_INTERVAL_HOURS = 24
 
 # Rate limit configuration
 RATE_LIMIT_RETRY_DELAY = 30
 MAX_RETRIES = 3
-REQUEST_TIMEOUT = 15  # Reduced from 30 for faster timeouts
+REQUEST_TIMEOUT = 15
 
 # Monthly update configuration
 MONTHLY_UPDATE_REMINDER_DAYS = 30
 UPDATE_RESPONSE_DEADLINE_DAYS = 3
 MONTHLY_CHECK_INTERVAL = 86400
+
+# Startup delay to let previous instance stop
+STARTUP_DELAY = 10
 
 # States for conversation
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
@@ -91,7 +102,6 @@ class ExcelManager:
 
     @staticmethod
     def save_user(user_id: int, username: str, country: str):
-        """Save or update user in Excel"""
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
@@ -113,7 +123,6 @@ class ExcelManager:
 
     @staticmethod
     def get_user_country(user_id: int) -> Optional[str]:
-        """Get user's current country"""
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
@@ -127,7 +136,6 @@ class ExcelManager:
 
     @staticmethod
     def update_user_products_country(user_id: int, new_country: str):
-        """Update country for all products of a user"""
         try:
             wb = load_workbook(PRODUCTS_FILE)
             ws = wb.active
@@ -147,7 +155,6 @@ class ExcelManager:
     @staticmethod
     def save_product(user_id: int, product_id: str, product_url: str, title: str, 
                     price: float, original_price: float, currency: str, image_url: str, country: str):
-        """Save product to Excel"""
         try:
             wb = load_workbook(PRODUCTS_FILE)
             ws = wb.active
@@ -174,7 +181,6 @@ class ExcelManager:
 
     @staticmethod
     def get_all_products() -> List[Dict]:
-        """Get all products for monitoring"""
         products = []
         try:
             wb = load_workbook(PRODUCTS_FILE)
@@ -202,7 +208,6 @@ class ExcelManager:
 
     @staticmethod
     def get_products_to_check(limit: int) -> List[Dict]:
-        """Get products that need to be checked"""
         all_products = ExcelManager.get_all_products()
         
         if not all_products:
@@ -222,7 +227,6 @@ class ExcelManager:
 
     @staticmethod
     def update_product_price(user_id: int, product_id: str, new_price: float, country: str = None, product_url: str = None):
-        """Update product price and last checked time"""
         try:
             wb = load_workbook(PRODUCTS_FILE)
             ws = wb.active
@@ -244,7 +248,6 @@ class ExcelManager:
     @staticmethod
     def save_price_change(user_id: int, product_id: str, title: str, old_price: float, 
                          new_price: float, currency: str):
-        """Save price change to history"""
         try:
             if abs(new_price - old_price) < 0.01:
                 return
@@ -274,13 +277,11 @@ class ExcelManager:
 
     @staticmethod
     def get_user_products(user_id: int) -> List[Dict]:
-        """Get all products for a specific user"""
         all_products = ExcelManager.get_all_products()
         return [p for p in all_products if p['user_id'] == user_id]
 
     @staticmethod
     def delete_product(user_id: int, product_id: str) -> bool:
-        """Delete a product from monitoring"""
         try:
             wb = load_workbook(PRODUCTS_FILE)
             ws = wb.active
@@ -301,7 +302,6 @@ class ExcelManager:
 
     @staticmethod
     def get_price_history(user_id: int, product_id: str, months: int = None) -> List[Dict]:
-        """Get price history for a product"""
         history = []
         try:
             wb = load_workbook(PRICE_HISTORY_FILE)
@@ -334,7 +334,6 @@ class ExcelManager:
 
     @staticmethod
     def get_all_user_price_history(user_id: int, months: int = None) -> Dict[str, List[Dict]]:
-        """Get price history for all products of a user"""
         products = ExcelManager.get_user_products(user_id)
         history_by_product = {}
         
@@ -350,7 +349,6 @@ class ExcelManager:
 
     @staticmethod
     def set_update_reminder(user_id: int):
-        """Set monthly update reminder for user"""
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
@@ -371,7 +369,6 @@ class ExcelManager:
 
     @staticmethod
     def clear_update_reminder(user_id: int):
-        """Clear update reminder after user responds"""
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
@@ -389,7 +386,6 @@ class ExcelManager:
 
     @staticmethod
     def get_users_needing_reminder() -> List[int]:
-        """Get users who need monthly update reminder"""
         users = []
         try:
             wb = load_workbook(USERS_FILE)
@@ -423,7 +419,6 @@ class ExcelManager:
 
     @staticmethod
     def get_users_past_deadline() -> List[int]:
-        """Get users who didn't respond and are past deadline"""
         users = []
         try:
             wb = load_workbook(USERS_FILE)
@@ -455,7 +450,6 @@ class ExcelManager:
 
     @staticmethod
     def delete_all_user_data(user_id: int):
-        """Delete all products and price history for a user"""
         try:
             wb = load_workbook(PRODUCTS_FILE)
             ws = wb.active
@@ -492,7 +486,7 @@ class ExcelManager:
 
 
 # ============================================================================
-# ASYNC ALIEXPRESS API CLIENT - OPTIMIZED FOR SPEED
+# ASYNC ALIEXPRESS API CLIENT
 # ============================================================================
 class AliExpressAPI:
     def __init__(self, app_key: str, app_secret: str, tracking_id: str):
@@ -504,7 +498,6 @@ class AliExpressAPI:
         self.session = None
 
     async def get_session(self):
-        """Get or create aiohttp session with connection pooling"""
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(
                 limit=50,
@@ -518,7 +511,6 @@ class AliExpressAPI:
         return self.session
 
     async def close_session(self):
-        """Close aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -565,7 +557,6 @@ class AliExpressAPI:
         return f"https://www.aliexpress.com/item/{product_id}.html"
 
     async def resolve_shortened_url(self, url: str, max_retries: int = 3) -> str:
-        """Async URL resolver"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         }
@@ -608,7 +599,6 @@ class AliExpressAPI:
         return any(pattern in error_msg.lower() for pattern in rate_limit_patterns)
 
     async def get_product_details(self, product_id: str, country: str = "US", retry_count: int = 0) -> Dict[str, Any]:
-        """Async product details fetcher - OPTIMIZED WITH TIMING"""
         start_time = time.time()
         
         method = "aliexpress.affiliate.productdetail.get"
@@ -706,7 +696,6 @@ class AliExpressAPI:
             return {"success": False, "error": str(e), "time_taken": elapsed_time}
 
     async def generate_affiliate_link(self, product_url: str, country: str = "US") -> Optional[str]:
-        """Async affiliate link generator"""
         method = "aliexpress.affiliate.link.generate"
         
         params = {
@@ -750,7 +739,6 @@ class AliExpressAPI:
 api_instance = None
 
 async def get_api_instance():
-    """Get or create global API instance"""
     global api_instance
     if api_instance is None:
         api_instance = AliExpressAPI(ALIEXPRESS_APP_KEY, ALIEXPRESS_APP_SECRET, ALIEXPRESS_TRACKING_ID)
@@ -761,7 +749,6 @@ async def get_api_instance():
 # HELPER FUNCTIONS
 # ============================================================================
 async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
-    """Safely edit message or send new one if editing fails"""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
@@ -779,11 +766,28 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
 
 
 # ============================================================================
+# ERROR HANDLER
+# ============================================================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    if isinstance(context.error, Conflict):
+        logger.error("Bot conflict detected! Another instance may be running.")
+        return
+    
+    # Log the full traceback
+    import traceback
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    logger.error(f"Traceback:\n{tb_string}")
+
+
+# ============================================================================
 # TELEGRAM BOT HANDLERS
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     user = update.effective_user
     user_id = user.id
     username = user.username or user.first_name
@@ -812,7 +816,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle country selection"""
     query = update.callback_query
     await query.answer()
 
@@ -856,7 +859,6 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show prompt to add a product"""
     query = update.callback_query
     await query.answer()
     
@@ -879,7 +881,6 @@ async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle product link submission - ASYNC VERSION WITH TIMING"""
     if not update.message or not update.message.text:
         return ENTERING_LINK
     
@@ -909,12 +910,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = ExcelManager.get_user_country(user_id) or "US"
     api = await get_api_instance()
 
-    # Async URL resolution with timing
-    url_start = time.time()
     if api.is_shortened_url(product_url):
         await processing_msg.edit_text("🔗 Resolving shortened URL...")
         product_url = await api.resolve_shortened_url(product_url)
-    url_time = time.time() - url_start
 
     product_id = api.extract_product_id(product_url)
 
@@ -935,10 +933,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await processing_msg.edit_text(f"📊 Fetching product details...")
 
-    # Async API call with timing
     result = await api.get_product_details(product_id, country)
-    
-    # Extract time taken from result
     api_time = result.get('time_taken', 0)
 
     if not result.get("success"):
@@ -958,13 +953,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ENTERING_LINK
 
-    # Async affiliate link generation with timing
-    affiliate_start = time.time()
     affiliate_link = await api.generate_affiliate_link(result['product_url'], country)
-    affiliate_time = time.time() - affiliate_start
 
-    # Save to Excel with timing
-    save_start = time.time()
     ExcelManager.save_product(
         user_id=user_id,
         product_id=product_id,
@@ -976,7 +966,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_url=result['image_url'],
         country=country
     )
-    save_time = time.time() - save_start
 
     total_time = time.time() - total_start_time
 
@@ -997,9 +986,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message += (
         f"🌍 <b>Country:</b> {country}\n"
         f"🆔 <b>ID:</b> {product_id}\n\n"
-        f"⏱️ <b>Processing Time:</b>\n"
-        f"   • API call: {api_time:.2f}s\n"
-        f"   • Total: {total_time:.2f}s\n\n"
+        f"⏱️ <b>Processing Time:</b> {total_time:.2f}s\n\n"
         f"🔔 <b>Price monitoring active!</b>\n\n"
         f"🔗 <code>{affiliate_link}</code>"
     )
@@ -1026,14 +1013,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
-    # Print timing info to console
-    print(f"   ⏱️ Product {product_id} added - API: {api_time:.2f}s, Total: {total_time:.2f}s")
+    print(f"   ⏱️ Product {product_id} added - Total: {total_time:.2f}s")
 
     return ENTERING_LINK
 
 
 async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's products"""
     query = update.callback_query
     if query:
         await query.answer()
@@ -1088,7 +1073,6 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show products with delete buttons"""
     query = update.callback_query
     await query.answer()
     
@@ -1116,7 +1100,6 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle product deletion"""
     query = update.callback_query
     await query.answer()
     
@@ -1152,7 +1135,6 @@ async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show price history selection"""
     query = update.callback_query
     if query:
         await query.answer()
@@ -1188,7 +1170,6 @@ async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display price history"""
     query = update.callback_query
     await query.answer()
     
@@ -1252,7 +1233,6 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chose to continue monitoring"""
     query = update.callback_query
     await query.answer()
     
@@ -1279,7 +1259,6 @@ async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return to main menu"""
     query = update.callback_query
     await query.answer()
     
@@ -1310,7 +1289,6 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help message"""
     query = update.callback_query
     if query:
         await query.answer()
@@ -1331,9 +1309,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Checks {CONCURRENT_REQUESTS} products simultaneously\n"
         f"• Updates every {MONITORING_INTERVAL//60} minutes\n"
         "• Instant notifications on price changes\n\n"
-        "<b>🔔 Monthly Updates:</b>\n"
-        f"• Reminder every {MONTHLY_UPDATE_REMINDER_DAYS} days\n"
-        f"• {UPDATE_RESPONSE_DEADLINE_DAYS} days to respond\n\n"
         "💡 <i>Optimized for speed and efficiency!</i>"
     )
 
@@ -1350,19 +1325,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# OPTIMIZED CONCURRENT PRICE MONITORING WITH TIMING
+# PRICE MONITORING
 # ============================================================================
 
 async def check_single_product(api: AliExpressAPI, product: Dict, context: ContextTypes.DEFAULT_TYPE) -> Dict:
-    """Check single product price - async WITH TIMING"""
     start_time = time.time()
     
     try:
         user_country = ExcelManager.get_user_country(product['user_id']) or product['country']
         
         result = await api.get_product_details(product['product_id'], user_country)
-        
-        # Get the API time from the result
         api_time = result.get('time_taken', 0)
         
         if not result.get("success"):
@@ -1411,7 +1383,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             change = new_price - old_price
             change_percent = (change / old_price * 100) if old_price > 0 else 0
             
-            print(f"   💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%) (⏱️ {api_time:.2f}s)")
+            print(f"   💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%)")
             
             emoji = "📉 PRICE DROP!" if change < 0 else "📈 PRICE INCREASE"
             
@@ -1455,7 +1427,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             except Exception as e:
                 print(f"      ❌ Notification failed: {e}")
         else:
-            print(f"   ✅ {product['product_id']}: ${new_price:.2f} (no change) (⏱️ {api_time:.2f}s)")
+            print(f"   ✅ {product['product_id']}: ${new_price:.2f} (no change)")
         
         return {
             'success': True,
@@ -1468,7 +1440,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
         
     except Exception as e:
         total_time = time.time() - start_time
-        print(f"   ❌ {product['product_id']}: Exception - {str(e)} (⏱️ {total_time:.2f}s)")
+        print(f"   ❌ {product['product_id']}: Exception - {str(e)}")
         return {
             'success': False,
             'product_id': product['product_id'],
@@ -1478,7 +1450,6 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
 
 
 async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Monitor products with CONCURRENT processing - MUCH FASTER WITH TIMING!"""
     print(f"\n{'='*70}")
     print(f"🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}")
@@ -1491,30 +1462,22 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
         print("⚠️ No products to check")
         return
 
-    print(f"📦 Checking {len(products_to_check)} products with {CONCURRENT_REQUESTS} concurrent requests...")
-    print(f"{'─'*70}")
+    print(f"📦 Checking {len(products_to_check)} products...")
     
     api = await get_api_instance()
     
-    # Process products in batches concurrently
     price_changes = 0
     checked = 0
     errors = 0
-    total_api_time = 0
     
     for i in range(0, len(products_to_check), CONCURRENT_REQUESTS):
         batch = products_to_check[i:i + CONCURRENT_REQUESTS]
-        batch_start = time.time()
         
-        print(f"\n📦 Batch {i//CONCURRENT_REQUESTS + 1}: Checking {len(batch)} products...")
+        print(f"\n📦 Batch {i//CONCURRENT_REQUESTS + 1}: {len(batch)} products...")
         
-        # Check multiple products simultaneously
         tasks = [check_single_product(api, product, context) for product in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        batch_time = time.time() - batch_start
-        
-        # Process results
         for result in results:
             if isinstance(result, Exception):
                 errors += 1
@@ -1522,76 +1485,23 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
                 
             if result.get('success'):
                 checked += 1
-                total_api_time += result.get('time_taken', 0)
                 if result.get('changed'):
                     price_changes += 1
             else:
                 errors += 1
         
-        print(f"   ⏱️ Batch completed in {batch_time:.2f}s")
-        
-        # Small delay between batches to avoid rate limits
         if i + CONCURRENT_REQUESTS < len(products_to_check):
             await asyncio.sleep(REQUEST_DELAY)
     
     cycle_time = time.time() - cycle_start
-    avg_time = total_api_time / checked if checked > 0 else 0
     
     print(f"\n{'─'*70}")
-    print(f"✅ CYCLE COMPLETE:")
-    print(f"   • Products checked: {checked}/{len(products_to_check)}")
-    print(f"   • Price changes: {price_changes}")
-    print(f"   • Errors: {errors}")
-    print(f"   • Average time per product: {avg_time:.2f}s")
-    print(f"   • Total cycle time: {cycle_time:.2f}s")
-    if cycle_time > 0:
-        print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
+    print(f"✅ CYCLE COMPLETE: {checked} checked, {price_changes} changes, {errors} errors")
+    print(f"   Total time: {cycle_time:.2f}s")
     print(f"{'='*70}\n")
 
 
-async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """Send monthly reminder"""
-    user_id = context.job.data
-    
-    products = ExcelManager.get_user_products(user_id)
-    
-    if not products:
-        return
-
-    ExcelManager.set_update_reminder(user_id)
-
-    message = (
-        "🔔 <b>Monthly Product List Update</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"You are currently monitoring <b>{len(products)}</b> product(s).\n\n"
-        "Would you like to:\n"
-        "• ✅ Continue monitoring current products\n"
-        "• 🗑️ Delete some products\n"
-        "• ➕ Add new products\n\n"
-        f"⚠️ <b>Please respond within {UPDATE_RESPONSE_DEADLINE_DAYS} days</b>"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("✅ Continue Monitoring", callback_data="update_continue")],
-        [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
-        [InlineKeyboardButton("🗑️ Manage Products", callback_data="manage_products")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=message,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        print(f"   ✅ Reminder sent to user {user_id}")
-    except Exception as e:
-        print(f"   ❌ Error sending reminder to user {user_id}: {e}")
-
-
 async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
-    """Check for users needing monthly reminder"""
     print(f"\n🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     users_need_reminder = ExcelManager.get_users_needing_reminder()
@@ -1599,12 +1509,34 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     for user_id in users_need_reminder:
         products = ExcelManager.get_user_products(user_id)
         if products:
-            print(f"   📨 Scheduling reminder for user {user_id}")
-            context.job_queue.run_once(
-                send_monthly_reminder_job,
-                when=1,
-                data=user_id
+            ExcelManager.set_update_reminder(user_id)
+
+            message = (
+                "🔔 <b>Monthly Product List Update</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"You are currently monitoring <b>{len(products)}</b> product(s).\n\n"
+                "Would you like to continue?\n\n"
+                f"⚠️ <b>Please respond within {UPDATE_RESPONSE_DEADLINE_DAYS} days</b>"
             )
+
+            keyboard = [
+                [InlineKeyboardButton("✅ Continue Monitoring", callback_data="update_continue")],
+                [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
+                [InlineKeyboardButton("🗑️ Manage Products", callback_data="manage_products")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML'
+                )
+                print(f"   ✅ Reminder sent to user {user_id}")
+            except Exception as e:
+                print(f"   ❌ Error sending reminder to user {user_id}: {e}")
+            
             await asyncio.sleep(2)
     
     users_past_deadline = ExcelManager.get_users_past_deadline()
@@ -1627,49 +1559,56 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
         
         ExcelManager.delete_all_user_data(user_id)
         ExcelManager.clear_update_reminder(user_id)
-    
-    if users_need_reminder:
-        print(f"   ✅ Sent {len(users_need_reminder)} reminder(s)")
-    if users_past_deadline:
-        print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
 
 
 # ============================================================================
-# POST INIT - CLEAR WEBHOOKS ON STARTUP
+# STARTUP WITH RETRY LOGIC
 # ============================================================================
 
 async def post_init(application: Application) -> None:
-    """Delete webhook and drop pending updates on startup"""
+    """Delete webhook and wait before starting"""
+    print(f"⏳ Waiting {STARTUP_DELAY} seconds for any previous instances to stop...")
+    await asyncio.sleep(STARTUP_DELAY)
+    
     print("🔄 Clearing any existing webhooks...")
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    print("✅ Webhook cleared, ready to poll!")
+    for attempt in range(3):
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook cleared successfully!")
+            break
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(5)
+    
+    await asyncio.sleep(2)
 
 
 # ============================================================================
-# MAIN FUNCTION - FIXED FOR RENDER DEPLOYMENT
+# MAIN FUNCTION
 # ============================================================================
 
 def main():
-    """Start the bot"""
     print(f"\n{'='*70}")
-    print("🤖 ALIEXPRESS PRICE MONITOR BOT - OPTIMIZED VERSION WITH TIMING")
+    print("🤖 ALIEXPRESS PRICE MONITOR BOT")
     print(f"{'='*70}")
     print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⏳ Startup delay: {STARTUP_DELAY} seconds")
     print(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
     print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
-    print(f"📦 Products per cycle: {PRODUCTS_PER_CYCLE}")
-    print(f"⏰ Request timeout: {REQUEST_TIMEOUT}s")
     print(f"{'='*70}\n")
 
     ExcelManager.init_excel_files()
 
-    # Build application with post_init to clear webhooks
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
+
+    # Add error handler
+    application.add_error_handler(error_handler)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1688,6 +1627,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
+        per_message=False,
     )
 
     application.add_handler(conv_handler)
@@ -1705,31 +1645,28 @@ def main():
     application.add_handler(CommandHandler("myproducts", view_my_products))
     application.add_handler(CommandHandler("history", view_price_history))
 
-    # Setup job queue for monitoring
+    # Setup job queue
     job_queue = application.job_queue
     
     if job_queue is not None:
         job_queue.run_repeating(
             monitor_prices,
             interval=MONITORING_INTERVAL,
-            first=10
+            first=30  # Start monitoring after 30 seconds
         )
         
         job_queue.run_repeating(
             check_monthly_updates,
             interval=MONTHLY_CHECK_INTERVAL,
-            first=60
+            first=120
         )
-        print("✅ Job queue enabled - automatic monitoring active!")
+        print("✅ Job queue enabled!")
     else:
         print("⚠️ Job queue not available!")
-        print("   Install with: pip install 'python-telegram-bot[job-queue]'")
-        print("   Automatic monitoring will NOT work without it.")
 
-    print("✅ BOT STARTED SUCCESSFULLY!")
+    print("✅ BOT STARTING...")
     print(f"⌨️  Press Ctrl+C to stop.\n")
 
-    # Run polling with drop_pending_updates
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
@@ -1741,11 +1678,7 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         print("\n⛔ Bot stopped by user")
-        if api_instance:
-            asyncio.run(api_instance.close_session())
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
-        if api_instance:
-            asyncio.run(api_instance.close_session())
