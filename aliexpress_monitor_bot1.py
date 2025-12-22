@@ -20,7 +20,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import BadRequest, Conflict
+from telegram.error import BadRequest
 
 # ============================================================================
 # CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
@@ -56,7 +56,7 @@ MONTHLY_CHECK_INTERVAL = 86400
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
 
 # ============================================================================
-# EXCEL MANAGEMENT - SAME AS BEFORE
+# EXCEL MANAGEMENT
 # ============================================================================
 class ExcelManager:
     @staticmethod
@@ -490,6 +490,7 @@ class ExcelManager:
             print(f"❌ Error deleting user data: {e}")
             return False
 
+
 # ============================================================================
 # ASYNC ALIEXPRESS API CLIENT - OPTIMIZED FOR SPEED
 # ============================================================================
@@ -506,7 +507,7 @@ class AliExpressAPI:
         """Get or create aiohttp session with connection pooling"""
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(
-                limit=50,  # Max concurrent connections
+                limit=50,
                 limit_per_host=10,
                 ttl_dns_cache=300
             )
@@ -608,7 +609,7 @@ class AliExpressAPI:
 
     async def get_product_details(self, product_id: str, country: str = "US", retry_count: int = 0) -> Dict[str, Any]:
         """Async product details fetcher - OPTIMIZED WITH TIMING"""
-        start_time = time.time()  # Start timing
+        start_time = time.time()
         
         method = "aliexpress.affiliate.productdetail.get"
         
@@ -635,7 +636,7 @@ class AliExpressAPI:
                 response.raise_for_status()
                 data = await response.json()
                 
-                elapsed_time = time.time() - start_time  # Calculate elapsed time
+                elapsed_time = time.time() - start_time
                 
                 if "error_response" in data:
                     error_msg = data["error_response"].get("msg", "API Error")
@@ -744,6 +745,7 @@ class AliExpressAPI:
         except Exception as e:
             return product_url
 
+
 # Global API instance
 api_instance = None
 
@@ -753,6 +755,7 @@ async def get_api_instance():
     if api_instance is None:
         api_instance = AliExpressAPI(ALIEXPRESS_APP_KEY, ALIEXPRESS_APP_SECRET, ALIEXPRESS_TRACKING_ID)
     return api_instance
+
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -774,8 +777,9 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
         except:
             pass
 
+
 # ============================================================================
-# TELEGRAM BOT HANDLERS - UPDATED WITH ASYNC API
+# TELEGRAM BOT HANDLERS
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -805,6 +809,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='HTML')
     return SELECTING_COUNTRY
+
 
 async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle country selection"""
@@ -849,6 +854,7 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(query, message, reply_markup)
     return ENTERING_LINK
 
+
 async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show prompt to add a product"""
     query = update.callback_query
@@ -871,12 +877,13 @@ async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await safe_edit_message(query, message, reply_markup)
     return ENTERING_LINK
 
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle product link submission - ASYNC VERSION WITH TIMING"""
     if not update.message or not update.message.text:
         return ENTERING_LINK
     
-    total_start_time = time.time()  # Start total timing
+    total_start_time = time.time()
     
     user_id = update.effective_user.id
     product_url = update.message.text.strip()
@@ -1024,6 +1031,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ENTERING_LINK
 
+
 async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's products"""
     query = update.callback_query
@@ -1078,6 +1086,7 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
+
 async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show products with delete buttons"""
     query = update.callback_query
@@ -1104,6 +1113,7 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await safe_edit_message(query, message, reply_markup)
+
 
 async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle product deletion"""
@@ -1140,6 +1150,7 @@ async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_
     else:
         await safe_edit_message(query, "❌ Error deleting product. Please try again.")
 
+
 async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show price history selection"""
     query = update.callback_query
@@ -1174,6 +1185,7 @@ async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_edit_message(query, message, reply_markup)
     else:
         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+
 
 async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display price history"""
@@ -1238,6 +1250,7 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await safe_edit_message(query, message, reply_markup)
 
+
 async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User chose to continue monitoring"""
     query = update.callback_query
@@ -1263,6 +1276,7 @@ async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_T
         f"You'll receive another reminder in {MONTHLY_UPDATE_REMINDER_DAYS} days.",
         reply_markup
     )
+
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return to main menu"""
@@ -1293,6 +1307,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await safe_edit_message(query, message, reply_markup)
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message"""
@@ -1332,6 +1347,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(query, help_text, reply_markup)
     else:
         await update.message.reply_text(help_text, reply_markup=reply_markup, parse_mode='HTML')
+
 
 # ============================================================================
 # OPTIMIZED CONCURRENT PRICE MONITORING WITH TIMING
@@ -1460,6 +1476,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             'time_taken': total_time
         }
 
+
 async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     """Monitor products with CONCURRENT processing - MUCH FASTER WITH TIMING!"""
     print(f"\n{'='*70}")
@@ -1527,8 +1544,10 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     print(f"   • Errors: {errors}")
     print(f"   • Average time per product: {avg_time:.2f}s")
     print(f"   • Total cycle time: {cycle_time:.2f}s")
-    print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
+    if cycle_time > 0:
+        print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
     print(f"{'='*70}\n")
+
 
 async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """Send monthly reminder"""
@@ -1569,6 +1588,7 @@ async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         print(f"   ✅ Reminder sent to user {user_id}")
     except Exception as e:
         print(f"   ❌ Error sending reminder to user {user_id}: {e}")
+
 
 async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     """Check for users needing monthly reminder"""
@@ -1613,14 +1633,20 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     if users_past_deadline:
         print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
 
-async def cleanup_session():
-    """Cleanup API session"""
-    global api_instance
-    if api_instance:
-        await api_instance.close_session()
 
 # ============================================================================
-# MAIN FUNCTION WITH ERROR HANDLING FOR CLOUD DEPLOYMENT
+# POST INIT - CLEAR WEBHOOKS ON STARTUP
+# ============================================================================
+
+async def post_init(application: Application) -> None:
+    """Delete webhook and drop pending updates on startup"""
+    print("🔄 Clearing any existing webhooks...")
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    print("✅ Webhook cleared, ready to poll!")
+
+
+# ============================================================================
+# MAIN FUNCTION - FIXED FOR RENDER DEPLOYMENT
 # ============================================================================
 
 def main():
@@ -1637,11 +1663,13 @@ def main():
 
     ExcelManager.init_excel_files()
 
-    # Create application with polling configuration for cloud deployment
-    application = Application.builder() \
-        .token(TELEGRAM_BOT_TOKEN) \
-        .concurrent_updates(True) \
+    # Build application with post_init to clear webhooks
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1660,7 +1688,6 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
-        per_message=False  # Important for cloud deployment
     )
 
     application.add_handler(conv_handler)
@@ -1678,48 +1705,47 @@ def main():
     application.add_handler(CommandHandler("myproducts", view_my_products))
     application.add_handler(CommandHandler("history", view_price_history))
 
+    # Setup job queue for monitoring
     job_queue = application.job_queue
     
-    job_queue.run_repeating(
-        monitor_prices,
-        interval=MONITORING_INTERVAL,
-        first=10
-    )
-    
-    job_queue.run_repeating(
-        check_monthly_updates,
-        interval=MONTHLY_CHECK_INTERVAL,
-        first=60
-    )
+    if job_queue is not None:
+        job_queue.run_repeating(
+            monitor_prices,
+            interval=MONITORING_INTERVAL,
+            first=10
+        )
+        
+        job_queue.run_repeating(
+            check_monthly_updates,
+            interval=MONTHLY_CHECK_INTERVAL,
+            first=60
+        )
+        print("✅ Job queue enabled - automatic monitoring active!")
+    else:
+        print("⚠️ Job queue not available!")
+        print("   Install with: pip install 'python-telegram-bot[job-queue]'")
+        print("   Automatic monitoring will NOT work without it.")
 
     print("✅ BOT STARTED SUCCESSFULLY!")
     print(f"⌨️  Press Ctrl+C to stop.\n")
 
-    try:
-        # Start polling with error handling for cloud platforms
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            timeout=30,
-            poll_interval=1.0,
-            close_loop=False
-        )
-    except Conflict as e:
-        print(f"\n❌ CONFLICT ERROR: Another bot instance is running.")
-        print("This is common when deploying to cloud platforms.")
-        print("Make sure only one instance is running.")
-        asyncio.run(cleanup_session())
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        asyncio.run(cleanup_session())
-        raise e
+    # Run polling with drop_pending_updates
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
         print("\n⛔ Bot stopped by user")
-        asyncio.run(cleanup_session())
+        if api_instance:
+            asyncio.run(api_instance.close_session())
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        asyncio.run(cleanup_session())
+        import traceback
+        traceback.print_exc()
+        if api_instance:
+            asyncio.run(api_instance.close_session())
