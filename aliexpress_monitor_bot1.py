@@ -7,7 +7,6 @@ import hmac
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import openpyxl
 from openpyxl import Workbook, load_workbook
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,7 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import BadRequest, Conflict
+from telegram.error import BadRequest
 import logging
 
 # Setup logging
@@ -31,12 +30,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
+# CONFIGURATION
 # ============================================================================
 TELEGRAM_BOT_TOKEN = "8354835888:AAF_F1KR40K6nmI_RwkDPwUa74L__CNuY3s"
 ALIEXPRESS_APP_KEY = "519492"
 ALIEXPRESS_APP_SECRET = "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk"
 ALIEXPRESS_TRACKING_ID = "hadef"
+
+# Webhook configuration for Render
+PORT = int(os.environ.get('PORT', 10000))
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
 # Excel files
 USERS_FILE = "users.xlsx"
@@ -48,7 +51,6 @@ CONCURRENT_REQUESTS = 10
 REQUEST_DELAY = 1
 MONITORING_INTERVAL = 300
 PRODUCTS_PER_CYCLE = 100
-MAX_CHECK_INTERVAL_HOURS = 24
 
 # Rate limit configuration
 RATE_LIMIT_RETRY_DELAY = 30
@@ -60,11 +62,9 @@ MONTHLY_UPDATE_REMINDER_DAYS = 30
 UPDATE_RESPONSE_DEADLINE_DAYS = 3
 MONTHLY_CHECK_INTERVAL = 86400
 
-# Startup delay to let previous instance stop
-STARTUP_DELAY = 10
-
 # States for conversation
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
+
 
 # ============================================================================
 # EXCEL MANAGEMENT
@@ -72,7 +72,6 @@ SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_H
 class ExcelManager:
     @staticmethod
     def init_excel_files():
-        """Initialize Excel files if they don't exist"""
         if not os.path.exists(USERS_FILE):
             wb = Workbook()
             ws = wb.active
@@ -203,7 +202,6 @@ class ExcelManager:
                     })
         except Exception as e:
             print(f"❌ Error getting products: {e}")
-        
         return products
 
     @staticmethod
@@ -259,19 +257,13 @@ class ExcelManager:
             change_percent = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0
             
             ws.append([
-                user_id,
-                product_id,
-                title,
-                old_price,
-                new_price,
-                round(change, 2),
-                round(change_percent, 2),
-                currency,
+                user_id, product_id, title, old_price, new_price,
+                round(change, 2), round(change_percent, 2), currency,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ])
             
             wb.save(PRICE_HISTORY_FILE)
-            print(f"✅ Price change archived: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
+            print(f"✅ Price change: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
         except Exception as e:
             print(f"❌ Error saving price change: {e}")
 
@@ -390,7 +382,6 @@ class ExcelManager:
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
-            
             now = datetime.now()
             
             for row in ws.iter_rows(min_row=2, values_only=True):
@@ -406,15 +397,12 @@ class ExcelManager:
                     try:
                         last_reminder_date = datetime.strptime(str(last_reminder), "%Y-%m-%d %H:%M:%S")
                         days_since = (now - last_reminder_date).days
-                        
                         if days_since >= MONTHLY_UPDATE_REMINDER_DAYS:
                             users.append(user_id)
                     except:
                         users.append(user_id)
-        
         except Exception as e:
             print(f"❌ Error getting users needing reminder: {e}")
-        
         return users
 
     @staticmethod
@@ -423,7 +411,6 @@ class ExcelManager:
         try:
             wb = load_workbook(USERS_FILE)
             ws = wb.active
-            
             now = datetime.now()
             
             for row in ws.iter_rows(min_row=2, values_only=True):
@@ -437,15 +424,12 @@ class ExcelManager:
                 if needs_response == "Yes" and deadline:
                     try:
                         deadline_date = datetime.strptime(str(deadline), "%Y-%m-%d %H:%M:%S")
-                        
                         if now > deadline_date:
                             users.append(user_id)
                     except:
                         pass
-        
         except Exception as e:
             print(f"❌ Error getting users past deadline: {e}")
-        
         return users
 
     @staticmethod
@@ -461,7 +445,6 @@ class ExcelManager:
             
             for row_idx in reversed(rows_to_delete):
                 ws.delete_rows(row_idx)
-            
             wb.save(PRODUCTS_FILE)
             
             wb = load_workbook(PRICE_HISTORY_FILE)
@@ -474,19 +457,17 @@ class ExcelManager:
             
             for row_idx in reversed(rows_to_delete):
                 ws.delete_rows(row_idx)
-            
             wb.save(PRICE_HISTORY_FILE)
             
             print(f"✅ Deleted all data for user {user_id}")
             return True
-            
         except Exception as e:
             print(f"❌ Error deleting user data: {e}")
             return False
 
 
 # ============================================================================
-# ASYNC ALIEXPRESS API CLIENT
+# ALIEXPRESS API
 # ============================================================================
 class AliExpressAPI:
     def __init__(self, app_key: str, app_secret: str, tracking_id: str):
@@ -499,15 +480,8 @@ class AliExpressAPI:
 
     async def get_session(self):
         if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=50,
-                limit_per_host=10,
-                ttl_dns_cache=300
-            )
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=self.timeout
-            )
+            connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
+            self.session = aiohttp.ClientSession(connector=connector, timeout=self.timeout)
         return self.session
 
     async def close_session(self):
@@ -519,33 +493,15 @@ class AliExpressAPI:
         return str(int(time.time() * 1000))
 
     def generate_signature(self, params: Dict[str, Any]) -> str:
-        params_to_sign = {
-            k: str(v) for k, v in params.items()
-            if k != "sign" and v is not None and v != ""
-        }
-        
+        params_to_sign = {k: str(v) for k, v in params.items() if k != "sign" and v is not None and v != ""}
         sorted_items = sorted(params_to_sign.items(), key=lambda x: x[0])
         canonical = "".join(f"{k}{v}" for k, v in sorted_items)
-        
-        signature = hmac.new(
-            self.app_secret.encode("utf-8"),
-            canonical.encode("utf-8"),
-            hashlib.md5,
-        ).hexdigest().upper()
-        
+        signature = hmac.new(self.app_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.md5).hexdigest().upper()
         return signature
 
     @staticmethod
     def extract_product_id(url: str) -> Optional[str]:
-        patterns = [
-            r"/item/(\d+)\.html",
-            r"/i/(\d+)\.html",
-            r"/(\d+)\.html",
-            r"item/(\d+)",
-            r"/goods/(\d+)",
-            r"product/(\d+)",
-            r"/dp/(\d+)",
-        ]
+        patterns = [r"/item/(\d+)\.html", r"/i/(\d+)\.html", r"/(\d+)\.html", r"item/(\d+)", r"/goods/(\d+)", r"product/(\d+)", r"/dp/(\d+)"]
         for p in patterns:
             m = re.search(p, url)
             if m:
@@ -557,66 +513,42 @@ class AliExpressAPI:
         return f"https://www.aliexpress.com/item/{product_id}.html"
 
     async def resolve_shortened_url(self, url: str, max_retries: int = 3) -> str:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        }
-        
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         session = await self.get_session()
         
         for attempt in range(max_retries):
             try:
                 async with session.head(url, allow_redirects=True, headers=headers) as response:
                     final_url = str(response.url)
-                    
                     if self.extract_product_id(final_url):
                         return final_url
-                
             except Exception as e:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
                 return url
-        
         return url
 
     @staticmethod
     def is_shortened_url(url: str) -> bool:
-        patterns = [
-            "s.click.aliexpress.com",
-            "a.aliexpress.com",
-            "/e/_",
-            "ali.ski",
-        ]
+        patterns = ["s.click.aliexpress.com", "a.aliexpress.com", "/e/_", "ali.ski"]
         return any(pattern in url.lower() for pattern in patterns)
 
     @staticmethod
     def is_rate_limited(error_msg: str) -> bool:
-        rate_limit_patterns = [
-            "frequency exceeds the limit",
-            "rate limit",
-            "too many requests",
-        ]
-        return any(pattern in error_msg.lower() for pattern in rate_limit_patterns)
+        patterns = ["frequency exceeds the limit", "rate limit", "too many requests"]
+        return any(pattern in error_msg.lower() for pattern in patterns)
 
     async def get_product_details(self, product_id: str, country: str = "US", retry_count: int = 0) -> Dict[str, Any]:
         start_time = time.time()
-        
         method = "aliexpress.affiliate.productdetail.get"
         
         params = {
-            "app_key": self.app_key,
-            "format": "json",
-            "method": method,
-            "sign_method": "hmac",
-            "timestamp": self._now_ms(),
-            "v": "2.0",
-            "tracking_id": self.tracking_id,
-            "product_ids": str(product_id),
-            "target_currency": "USD",
-            "target_language": "EN",
-            "country": country,
+            "app_key": self.app_key, "format": "json", "method": method,
+            "sign_method": "hmac", "timestamp": self._now_ms(), "v": "2.0",
+            "tracking_id": self.tracking_id, "product_ids": str(product_id),
+            "target_currency": "USD", "target_language": "EN", "country": country,
         }
-        
         params["sign"] = self.generate_signature(params)
         
         session = await self.get_session()
@@ -625,17 +557,14 @@ class AliExpressAPI:
             async with session.get(self.api_url, params=params) as response:
                 response.raise_for_status()
                 data = await response.json()
-                
                 elapsed_time = time.time() - start_time
                 
                 if "error_response" in data:
                     error_msg = data["error_response"].get("msg", "API Error")
-                    
                     if self.is_rate_limited(error_msg) and retry_count < MAX_RETRIES:
                         wait_time = RATE_LIMIT_RETRY_DELAY * (2 ** retry_count)
                         await asyncio.sleep(wait_time)
                         return await self.get_product_details(product_id, country, retry_count + 1)
-                    
                     return {"success": False, "error": error_msg, "time_taken": elapsed_time}
                 
                 resp_key = None
@@ -663,8 +592,7 @@ class AliExpressAPI:
                     if val is None:
                         return None
                     try:
-                        price_str = str(val).replace("USD", "").replace("$", "").replace(",", "").strip()
-                        return float(price_str)
+                        return float(str(val).replace("USD", "").replace("$", "").replace(",", "").strip())
                     except:
                         return None
                 
@@ -689,27 +617,17 @@ class AliExpressAPI:
                 }
                 
         except asyncio.TimeoutError:
-            elapsed_time = time.time() - start_time
-            return {"success": False, "error": "Request timeout", "time_taken": elapsed_time}
+            return {"success": False, "error": "Request timeout", "time_taken": time.time() - start_time}
         except Exception as e:
-            elapsed_time = time.time() - start_time
-            return {"success": False, "error": str(e), "time_taken": elapsed_time}
+            return {"success": False, "error": str(e), "time_taken": time.time() - start_time}
 
     async def generate_affiliate_link(self, product_url: str, country: str = "US") -> Optional[str]:
         method = "aliexpress.affiliate.link.generate"
-        
         params = {
-            "app_key": self.app_key,
-            "format": "json",
-            "method": method,
-            "sign_method": "hmac",
-            "timestamp": self._now_ms(),
-            "v": "2.0",
-            "tracking_id": self.tracking_id,
-            "promotion_link_type": "0",
-            "source_values": product_url,
+            "app_key": self.app_key, "format": "json", "method": method,
+            "sign_method": "hmac", "timestamp": self._now_ms(), "v": "2.0",
+            "tracking_id": self.tracking_id, "promotion_link_type": "0", "source_values": product_url,
         }
-        
         params["sign"] = self.generate_signature(params)
         
         session = await self.get_session()
@@ -717,7 +635,6 @@ class AliExpressAPI:
         try:
             async with session.post(self.api_url, data=params) as response:
                 data = await response.json()
-                
                 if "error_response" in data:
                     return product_url
                 
@@ -728,9 +645,7 @@ class AliExpressAPI:
                     links = result.get("result", {}).get("promotion_links", {}).get("promotion_link", [])
                     if links:
                         return links[0].get("promotion_link")
-                
                 return product_url
-                
         except Exception as e:
             return product_url
 
@@ -751,7 +666,7 @@ async def get_api_instance():
 async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except BadRequest as e:
+    except BadRequest:
         try:
             await query.message.delete()
         except:
@@ -766,40 +681,16 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
 
 
 # ============================================================================
-# ERROR HANDLER
+# BOT HANDLERS
 # ============================================================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors"""
-    logger.error(f"Exception while handling an update: {context.error}")
-    
-    if isinstance(context.error, Conflict):
-        logger.error("Bot conflict detected! Another instance may be running.")
-        return
-    
-    # Log the full traceback
-    import traceback
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = "".join(tb_list)
-    logger.error(f"Traceback:\n{tb_string}")
-
-
-# ============================================================================
-# TELEGRAM BOT HANDLERS
-# ============================================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id
     username = user.username or user.first_name
 
     keyboard = [
-        [
-            InlineKeyboardButton("🇫🇷 France", callback_data="country_FR"),
-            InlineKeyboardButton("🇮🇹 Italy", callback_data="country_IT"),
-        ],
-        [
-            InlineKeyboardButton("🇺🇸 United States", callback_data="country_US"),
-        ]
+        [InlineKeyboardButton("🇫🇷 France", callback_data="country_FR"),
+         InlineKeyboardButton("🇮🇹 Italy", callback_data="country_IT")],
+        [InlineKeyboardButton("🇺🇸 United States", callback_data="country_US")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -807,7 +698,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 <b>Welcome {username}!</b>\n\n"
         "🛍️ <b>AliExpress Price Monitor Bot</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "I will help you track AliExpress product prices and notify you of changes!\n\n"
+        "I will help you track AliExpress product prices!\n\n"
         "📍 <b>Please select your country:</b>"
     )
 
@@ -826,24 +717,18 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ExcelManager.save_user(user_id, username, country)
     updated_count = ExcelManager.update_user_products_country(user_id, country)
-
     context.user_data['country'] = country
 
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
-
-    message = (
-        f"✅ <b>Country Selected: {country_flags.get(country, '')} {country}</b>\n\n"
-    )
-
+    
+    message = f"✅ <b>Country Selected: {country_flags.get(country, '')} {country}</b>\n\n"
     if updated_count > 0:
         message += f"🔄 Updated {updated_count} existing products\n\n"
-
     message += (
-        f"📎 <b>Now send me an AliExpress product link:</b>\n\n"
-        f"<i>Supported formats:</i>\n"
-        f"• <code>https://www.aliexpress.com/item/xxxxx.html</code>\n"
-        f"• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n"
-        f"💡 Or use the menu below:"
+        "📎 <b>Now send me an AliExpress product link:</b>\n\n"
+        "<i>Supported formats:</i>\n"
+        "• <code>https://www.aliexpress.com/item/xxxxx.html</code>\n"
+        "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>"
     )
 
     keyboard = [
@@ -867,7 +752,7 @@ async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "<i>Supported formats:</i>\n"
         "• <code>https://www.aliexpress.com/item/xxxxx.html</code>\n"
         "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n"
-        "💡 Just paste the link and send it to me!"
+        "💡 Just paste the link and send it!"
     )
     
     keyboard = [
@@ -884,24 +769,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return ENTERING_LINK
     
-    total_start_time = time.time()
-    
     user_id = update.effective_user.id
     product_url = update.message.text.strip()
 
     if "aliexpress" not in product_url.lower():
         keyboard = [
             [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
-            [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await update.message.reply_text(
-            "❌ <b>Invalid Link</b>\n\n"
-            "Please send a valid AliExpress product link.",
-            reply_markup=reply_markup,
-            parse_mode='HTML'
+            "❌ <b>Invalid Link</b>\n\nPlease send a valid AliExpress product link.",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
 
@@ -917,103 +795,63 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     product_id = api.extract_product_id(product_url)
 
     if not product_id:
-        keyboard = [
-            [InlineKeyboardButton("➕ Try Again", callback_data="add_product")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+        keyboard = [[InlineKeyboardButton("➕ Try Again", callback_data="add_product")],
+                   [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
         await processing_msg.edit_text(
-            "❌ <b>Could not extract product ID</b>\n\n"
-            "Please send a valid AliExpress link.",
-            reply_markup=reply_markup,
-            parse_mode='HTML'
+            "❌ <b>Could not extract product ID</b>\n\nPlease send a valid AliExpress link.",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
 
-    await processing_msg.edit_text(f"📊 Fetching product details...")
-
+    await processing_msg.edit_text("📊 Fetching product details...")
     result = await api.get_product_details(product_id, country)
-    api_time = result.get('time_taken', 0)
 
     if not result.get("success"):
-        keyboard = [
-            [InlineKeyboardButton("➕ Try Another", callback_data="add_product")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+        keyboard = [[InlineKeyboardButton("➕ Try Another", callback_data="add_product")],
+                   [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
         await processing_msg.edit_text(
-            f"❌ <b>Cannot monitor this product</b>\n\n"
-            f"<b>Reason:</b> {result.get('error')}\n"
-            f"<b>Time taken:</b> {api_time:.2f}s\n\n"
-            "💡 Try another product or check back later.",
-            reply_markup=reply_markup,
-            parse_mode='HTML'
+            f"❌ <b>Cannot monitor this product</b>\n\n<b>Reason:</b> {result.get('error')}",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
 
     affiliate_link = await api.generate_affiliate_link(result['product_url'], country)
 
     ExcelManager.save_product(
-        user_id=user_id,
-        product_id=product_id,
-        product_url=affiliate_link,
-        title=result['title'],
-        price=result['price'],
-        original_price=result['original_price'],
-        currency=result['currency'],
-        image_url=result['image_url'],
-        country=country
+        user_id=user_id, product_id=product_id, product_url=affiliate_link,
+        title=result['title'], price=result['price'], original_price=result['original_price'],
+        currency=result['currency'], image_url=result['image_url'], country=country
     )
-
-    total_time = time.time() - total_start_time
 
     discount = result['original_price'] - result['price']
     discount_percent = (discount / result['original_price'] * 100) if result['original_price'] > 0 else 0
 
     message = (
-        "✅ <b>Product Added Successfully!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ <b>Product Added Successfully!</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📦 <b>{result['title'][:80]}...</b>\n\n"
         f"💵 <b>Current:</b> ${result['price']:.2f}\n"
         f"💰 <b>Original:</b> ${result['original_price']:.2f}\n"
     )
-
     if discount > 0:
         message += f"🏷️ <b>Discount:</b> ${discount:.2f} ({discount_percent:.1f}% OFF)\n"
-
-    message += (
-        f"🌍 <b>Country:</b> {country}\n"
-        f"🆔 <b>ID:</b> {product_id}\n\n"
-        f"⏱️ <b>Processing Time:</b> {total_time:.2f}s\n\n"
-        f"🔔 <b>Price monitoring active!</b>\n\n"
-        f"🔗 <code>{affiliate_link}</code>"
-    )
+    message += f"🌍 <b>Country:</b> {country}\n\n🔔 <b>Price monitoring active!</b>\n\n🔗 <code>{affiliate_link}</code>"
 
     keyboard = [
-        [InlineKeyboardButton("➕ Add Another Product", callback_data="add_product")],
+        [InlineKeyboardButton("➕ Add Another", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if result.get('image_url'):
         try:
-            await update.message.reply_photo(
-                photo=result['image_url'],
-                caption=message,
-                reply_markup=reply_markup,
-                parse_mode='HTML'
-            )
+            await update.message.reply_photo(photo=result['image_url'], caption=message, 
+                                            reply_markup=reply_markup, parse_mode='HTML')
             await processing_msg.delete()
         except:
             await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
     else:
         await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
-
-    print(f"   ⏱️ Product {product_id} added - Total: {total_time:.2f}s")
 
     return ENTERING_LINK
 
@@ -1027,36 +865,22 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products = ExcelManager.get_user_products(user_id)
 
     if not products:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        message = (
-            "📭 <b>No Products Yet</b>\n\n"
-            "You haven't added any products to monitor.\n\n"
-            "Click 'Add Product' to start tracking prices!"
-        )
-        
+        keyboard = [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+                   [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]]
+        message = "📭 <b>No Products Yet</b>\n\nClick 'Add Product' to start tracking!"
         if query:
-            await safe_edit_message(query, message, reply_markup)
+            await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
         else:
-            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return
 
-    message = f"📦 <b>Your Monitored Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-
+    message = f"📦 <b>Your Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
     for i, product in enumerate(products[:5], 1):
         title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
-        message += (
-            f"{i}. <b>{title}</b>\n"
-            f"   💵 ${product['current_price']:.2f}\n"
-            f"   🌍 {product['country']}\n\n"
-        )
+        message += f"{i}. <b>{title}</b>\n   💵 ${product['current_price']:.2f} | 🌍 {product['country']}\n\n"
 
     if len(products) > 5:
-        message += f"<i>...and {len(products) - 5} more</i>\n\n"
+        message += f"<i>...and {len(products) - 5} more</i>\n"
 
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
@@ -1064,12 +888,11 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     if query:
-        await safe_edit_message(query, message, reply_markup)
+        await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1079,24 +902,15 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     products = ExcelManager.get_user_products(user_id)
 
-    message = f"🗑️ <b>Manage Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    message += "Select a product to delete:\n\n"
+    message = f"🗑️ <b>Manage Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\nSelect a product to delete:\n"
 
     keyboard = []
     for product in products:
         title = product['title'][:30] + "..." if len(product['title']) > 30 else product['title']
-        keyboard.append([
-            InlineKeyboardButton(
-                f"❌ {title} - ${product['current_price']:.2f}",
-                callback_data=f"delete_{product['product_id']}"
-            )
-        ])
+        keyboard.append([InlineKeyboardButton(f"❌ {title}", callback_data=f"delete_{product['product_id']}")])
 
-    keyboard.append([InlineKeyboardButton("➕ Add Product", callback_data="add_product")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="view_myproducts")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await safe_edit_message(query, message, reply_markup)
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
 
 
 async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1115,23 +929,15 @@ async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_
 
     success = ExcelManager.delete_product(user_id, product_id)
 
+    keyboard = [
+        [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
+    ]
+    
     if success:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
-            [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await safe_edit_message(
-            query,
-            f"✅ <b>Product Deleted</b>\n\n"
-            f"<b>{product_title}</b>\n\n"
-            f"This product has been removed from monitoring.",
-            reply_markup
-        )
+        await safe_edit_message(query, f"✅ <b>Product Deleted</b>\n\n{product_title}", InlineKeyboardMarkup(keyboard))
     else:
-        await safe_edit_message(query, "❌ Error deleting product. Please try again.")
+        await safe_edit_message(query, "❌ Error deleting product.", InlineKeyboardMarkup(keyboard))
 
 
 async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1139,34 +945,20 @@ async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query:
         await query.answer()
     
-    message = (
-        "📊 <b>Price History</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Select time period to view price changes:\n\n"
-        "💡 Only actual price changes are archived"
-    )
+    message = "📊 <b>Price History</b>\n━━━━━━━━━━━━━━━━━━━━━\n\nSelect time period:"
 
     keyboard = [
-        [
-            InlineKeyboardButton("1 Month", callback_data="history_1"),
-            InlineKeyboardButton("2 Months", callback_data="history_2"),
-            InlineKeyboardButton("3 Months", callback_data="history_3"),
-        ],
-        [
-            InlineKeyboardButton("4 Months", callback_data="history_4"),
-            InlineKeyboardButton("5 Months", callback_data="history_5"),
-            InlineKeyboardButton("6 Months", callback_data="history_6"),
-        ],
+        [InlineKeyboardButton("1 Month", callback_data="history_1"),
+         InlineKeyboardButton("3 Months", callback_data="history_3"),
+         InlineKeyboardButton("6 Months", callback_data="history_6")],
         [InlineKeyboardButton("📅 All Time", callback_data="history_all")],
-        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("🔙 Back", callback_data="view_myproducts")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     if query:
-        await safe_edit_message(query, message, reply_markup)
+        await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1180,19 +972,9 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
     history_data = ExcelManager.get_all_user_price_history(user_id, months)
 
     if not history_data:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
-            [InlineKeyboardButton("🔙 Back", callback_data="view_history")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="view_history")]]
         period_text = f"last {period} month(s)" if period != "all" else "all time"
-        await safe_edit_message(
-            query,
-            f"📊 <b>No Price Changes</b>\n\n"
-            f"No price changes recorded for {period_text}.",
-            reply_markup
-        )
+        await safe_edit_message(query, f"📊 <b>No Price Changes</b>\n\nNo changes recorded for {period_text}.", InlineKeyboardMarkup(keyboard))
         return
 
     period_text = f"Last {period} Month(s)" if period != "all" else "All Time"
@@ -1210,26 +992,19 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for change in history[:3]:
             date = datetime.strptime(change['date'], "%Y-%m-%d %H:%M:%S").strftime("%m/%d")
             emoji = "📉" if change['change_amount'] < 0 else "📈"
-            message += (
-                f"   {emoji} ${change['old_price']:.2f} → ${change['new_price']:.2f} "
-                f"({change['change_percent']:+.1f}%) - {date}\n"
-            )
+            message += f"   {emoji} ${change['old_price']:.2f} → ${change['new_price']:.2f} ({change['change_percent']:+.1f}%) - {date}\n"
         
         if len(history) > 3:
-            message += f"   <i>...and {len(history) - 3} more changes</i>\n"
-        
+            message += f"   <i>...and {len(history) - 3} more</i>\n"
         message += "\n"
 
     message += f"📈 <b>Total Changes:</b> {total_changes}"
 
     keyboard = [
-        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("🔄 Change Period", callback_data="view_history")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await safe_edit_message(query, message, reply_markup)
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
 
 
 async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1238,24 +1013,13 @@ async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_T
     
     user_id = update.effective_user.id
     ExcelManager.clear_update_reminder(user_id)
-    
     products = ExcelManager.get_user_products(user_id)
 
     keyboard = [
-        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await safe_edit_message(
-        query,
-        f"✅ <b>Monitoring Continued</b>\n\n"
-        f"Your <b>{len(products)}</b> product(s) will continue to be monitored.\n\n"
-        f"You'll receive another reminder in {MONTHLY_UPDATE_REMINDER_DAYS} days.",
-        reply_markup
-    )
+    await safe_edit_message(query, f"✅ <b>Monitoring Continued</b>\n\nYour <b>{len(products)}</b> product(s) will continue to be monitored.", InlineKeyboardMarkup(keyboard))
 
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1265,16 +1029,13 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     country = ExcelManager.get_user_country(user_id) or "US"
     products = ExcelManager.get_user_products(user_id)
-
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
 
     message = (
-        "🏠 <b>Main Menu</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🏠 <b>Main Menu</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🌍 <b>Country:</b> {country_flags.get(country, '')} {country}\n"
-        f"📦 <b>Monitored Products:</b> {len(products)}\n\n"
-        "Send me an AliExpress link to add a product,\n"
-        "or use the buttons below:"
+        f"📦 <b>Products:</b> {len(products)}\n\n"
+        "Send me an AliExpress link to add a product!"
     )
 
     keyboard = [
@@ -1283,9 +1044,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="show_help")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await safe_edit_message(query, message, reply_markup)
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1294,168 +1053,88 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     
     help_text = (
-        "ℹ️ <b>Help - AliExpress Price Monitor</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>🔧 How it works:</b>\n"
+        "ℹ️ <b>Help</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>How it works:</b>\n"
         "1️⃣ Select your country\n"
-        "2️⃣ Send product links to monitor\n"
-        "3️⃣ Get notified when prices change!\n\n"
-        "<b>📋 Commands:</b>\n"
+        "2️⃣ Send product links\n"
+        "3️⃣ Get notified on price changes!\n\n"
+        "<b>Commands:</b>\n"
         "/start - Start the bot\n"
         "/help - Show this help\n"
-        "/myproducts - View monitored products\n"
-        "/history - View price history\n\n"
-        "<b>⚡ Fast Monitoring:</b>\n"
-        f"• Checks {CONCURRENT_REQUESTS} products simultaneously\n"
-        f"• Updates every {MONITORING_INTERVAL//60} minutes\n"
-        "• Instant notifications on price changes\n\n"
-        "💡 <i>Optimized for speed and efficiency!</i>"
+        "/myproducts - View products\n"
+        "/history - View price history"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
+    
     if query:
-        await safe_edit_message(query, help_text, reply_markup)
+        await safe_edit_message(query, help_text, InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(help_text, reply_markup=reply_markup, parse_mode='HTML')
+        await update.message.reply_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 # ============================================================================
 # PRICE MONITORING
 # ============================================================================
-
 async def check_single_product(api: AliExpressAPI, product: Dict, context: ContextTypes.DEFAULT_TYPE) -> Dict:
-    start_time = time.time()
-    
     try:
         user_country = ExcelManager.get_user_country(product['user_id']) or product['country']
-        
         result = await api.get_product_details(product['product_id'], user_country)
-        api_time = result.get('time_taken', 0)
         
         if not result.get("success"):
-            ExcelManager.update_product_price(
-                product['user_id'],
-                product['product_id'],
-                product['current_price'],
-                user_country
-            )
-            
-            total_time = time.time() - start_time
-            print(f"   ❌ {product['product_id']}: {result.get('error')} (⏱️ {api_time:.2f}s)")
-            
-            return {
-                'success': False,
-                'product_id': product['product_id'],
-                'error': result.get('error'),
-                'time_taken': total_time
-            }
+            ExcelManager.update_product_price(product['user_id'], product['product_id'], product['current_price'], user_country)
+            return {'success': False, 'product_id': product['product_id'], 'error': result.get('error')}
         
         new_price = result['price']
         old_price = product['current_price']
         
-        ExcelManager.update_product_price(
-            product['user_id'],
-            product['product_id'],
-            new_price,
-            user_country,
-            result['product_url']
-        )
+        ExcelManager.update_product_price(product['user_id'], product['product_id'], new_price, user_country, result['product_url'])
         
         price_changed = abs(new_price - old_price) > 0.01
         
-        total_time = time.time() - start_time
-        
         if price_changed:
-            ExcelManager.save_price_change(
-                user_id=product['user_id'],
-                product_id=product['product_id'],
-                title=product['title'],
-                old_price=old_price,
-                new_price=new_price,
-                currency=product['currency']
-            )
+            ExcelManager.save_price_change(product['user_id'], product['product_id'], product['title'], old_price, new_price, product['currency'])
             
             change = new_price - old_price
             change_percent = (change / old_price * 100) if old_price > 0 else 0
-            
-            print(f"   💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%)")
-            
             emoji = "📉 PRICE DROP!" if change < 0 else "📈 PRICE INCREASE"
             
             affiliate_link = await api.generate_affiliate_link(result['product_url'], user_country)
             
             notification = (
-                f"{emoji}\n\n"
-                f"<b>{product['title'][:80]}...</b>\n\n"
+                f"{emoji}\n\n<b>{product['title'][:80]}...</b>\n\n"
                 f"💵 <b>Old:</b> ${old_price:.2f}\n"
                 f"💵 <b>New:</b> ${new_price:.2f}\n"
                 f"📊 <b>Change:</b> ${change:+.2f} ({change_percent:+.1f}%)\n"
             )
-            
             if change < 0:
                 notification += f"💰 <b>You Save:</b> ${abs(change):.2f}\n"
-            
             notification += f"\n🔗 <code>{affiliate_link}</code>"
             
-            keyboard = [
-                [InlineKeyboardButton("🛒 Buy Now", url=affiliate_link)],
-                [InlineKeyboardButton("📊 View History", callback_data="view_history")],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            keyboard = [[InlineKeyboardButton("🛒 Buy Now", url=affiliate_link)],
+                       [InlineKeyboardButton("📊 View History", callback_data="view_history")]]
             
             try:
                 if product.get('image_url'):
-                    await context.bot.send_photo(
-                        chat_id=product['user_id'],
-                        photo=product['image_url'],
-                        caption=notification,
-                        reply_markup=reply_markup,
-                        parse_mode='HTML'
-                    )
+                    await context.bot.send_photo(chat_id=product['user_id'], photo=product['image_url'],
+                                                caption=notification, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
                 else:
-                    await context.bot.send_message(
-                        chat_id=product['user_id'],
-                        text=notification,
-                        reply_markup=reply_markup,
-                        parse_mode='HTML'
-                    )
+                    await context.bot.send_message(chat_id=product['user_id'], text=notification,
+                                                  reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
             except Exception as e:
-                print(f"      ❌ Notification failed: {e}")
-        else:
-            print(f"   ✅ {product['product_id']}: ${new_price:.2f} (no change)")
+                print(f"Notification failed: {e}")
         
-        return {
-            'success': True,
-            'product_id': product['product_id'],
-            'old_price': old_price,
-            'new_price': new_price,
-            'changed': price_changed,
-            'time_taken': total_time
-        }
+        return {'success': True, 'product_id': product['product_id'], 'changed': price_changed}
         
     except Exception as e:
-        total_time = time.time() - start_time
-        print(f"   ❌ {product['product_id']}: Exception - {str(e)}")
-        return {
-            'success': False,
-            'product_id': product['product_id'],
-            'error': str(e),
-            'time_taken': total_time
-        }
+        return {'success': False, 'product_id': product['product_id'], 'error': str(e)}
 
 
 async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
-    print(f"\n{'='*70}")
-    print(f"🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*70}")
+    print(f"\n{'='*50}")
+    print(f"🔍 MONITORING - {datetime.now().strftime('%H:%M:%S')}")
+    print(f"{'='*50}")
     
-    cycle_start = time.time()
-
     products_to_check = ExcelManager.get_products_to_check(PRODUCTS_PER_CYCLE)
     
     if not products_to_check:
@@ -1465,44 +1144,25 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     print(f"📦 Checking {len(products_to_check)} products...")
     
     api = await get_api_instance()
-    
-    price_changes = 0
-    checked = 0
-    errors = 0
+    changes = 0
     
     for i in range(0, len(products_to_check), CONCURRENT_REQUESTS):
         batch = products_to_check[i:i + CONCURRENT_REQUESTS]
-        
-        print(f"\n📦 Batch {i//CONCURRENT_REQUESTS + 1}: {len(batch)} products...")
-        
         tasks = [check_single_product(api, product, context) for product in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for result in results:
-            if isinstance(result, Exception):
-                errors += 1
-                continue
-                
-            if result.get('success'):
-                checked += 1
-                if result.get('changed'):
-                    price_changes += 1
-            else:
-                errors += 1
+            if isinstance(result, dict) and result.get('changed'):
+                changes += 1
         
         if i + CONCURRENT_REQUESTS < len(products_to_check):
             await asyncio.sleep(REQUEST_DELAY)
     
-    cycle_time = time.time() - cycle_start
-    
-    print(f"\n{'─'*70}")
-    print(f"✅ CYCLE COMPLETE: {checked} checked, {price_changes} changes, {errors} errors")
-    print(f"   Total time: {cycle_time:.2f}s")
-    print(f"{'='*70}\n")
+    print(f"✅ Done! {changes} price changes found.")
 
 
 async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
-    print(f"\n🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔔 Checking monthly updates...")
     
     users_need_reminder = ExcelManager.get_users_needing_reminder()
     
@@ -1510,112 +1170,64 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
         products = ExcelManager.get_user_products(user_id)
         if products:
             ExcelManager.set_update_reminder(user_id)
-
             message = (
-                "🔔 <b>Monthly Product List Update</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"You are currently monitoring <b>{len(products)}</b> product(s).\n\n"
-                "Would you like to continue?\n\n"
-                f"⚠️ <b>Please respond within {UPDATE_RESPONSE_DEADLINE_DAYS} days</b>"
+                "🔔 <b>Monthly Update</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"You're monitoring <b>{len(products)}</b> product(s).\n\n"
+                f"⚠️ Please respond within {UPDATE_RESPONSE_DEADLINE_DAYS} days"
             )
-
             keyboard = [
-                [InlineKeyboardButton("✅ Continue Monitoring", callback_data="update_continue")],
-                [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
-                [InlineKeyboardButton("🗑️ Manage Products", callback_data="manage_products")],
+                [InlineKeyboardButton("✅ Continue", callback_data="update_continue")],
+                [InlineKeyboardButton("🗑️ Manage", callback_data="manage_products")],
             ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    reply_markup=reply_markup,
-                    parse_mode='HTML'
-                )
-                print(f"   ✅ Reminder sent to user {user_id}")
+                await context.bot.send_message(chat_id=user_id, text=message, 
+                                              reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
             except Exception as e:
-                print(f"   ❌ Error sending reminder to user {user_id}: {e}")
-            
+                print(f"Reminder failed for {user_id}: {e}")
             await asyncio.sleep(2)
     
     users_past_deadline = ExcelManager.get_users_past_deadline()
-    
     for user_id in users_past_deadline:
-        print(f"   🗑️ Cleaning up user {user_id} (no response)")
-        
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "⚠️ <b>Products Removed</b>\n\n"
-                    f"Your monitored products have been removed due to no response.\n\n"
-                    "You can start monitoring again anytime by using /start"
-                ),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            print(f"   ❌ Error sending cleanup notification: {e}")
-        
+            await context.bot.send_message(chat_id=user_id, text="⚠️ Products removed due to no response. Use /start to begin again.", parse_mode='HTML')
+        except:
+            pass
         ExcelManager.delete_all_user_data(user_id)
         ExcelManager.clear_update_reminder(user_id)
 
 
 # ============================================================================
-# STARTUP WITH RETRY LOGIC
+# MAIN - WEBHOOK MODE FOR RENDER
 # ============================================================================
-
 async def post_init(application: Application) -> None:
-    """Delete webhook and wait before starting"""
-    print(f"⏳ Waiting {STARTUP_DELAY} seconds for any previous instances to stop...")
-    await asyncio.sleep(STARTUP_DELAY)
+    """Setup webhook after initialization"""
+    await application.bot.delete_webhook(drop_pending_updates=True)
     
-    print("🔄 Clearing any existing webhooks...")
-    for attempt in range(3):
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            print("✅ Webhook cleared successfully!")
-            break
-        except Exception as e:
-            print(f"⚠️ Attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                await asyncio.sleep(5)
-    
-    await asyncio.sleep(2)
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        print(f"✅ Webhook set to: {webhook_url}")
+    else:
+        print("⚠️ No RENDER_EXTERNAL_URL found, using polling mode")
 
-
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
 
 def main():
-    print(f"\n{'='*70}")
+    print(f"\n{'='*50}")
     print("🤖 ALIEXPRESS PRICE MONITOR BOT")
-    print(f"{'='*70}")
+    print(f"{'='*50}")
     print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⏳ Startup delay: {STARTUP_DELAY} seconds")
-    print(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
-    print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
-    print(f"{'='*70}\n")
+    print(f"🌐 Port: {PORT}")
+    print(f"🔗 URL: {RENDER_EXTERNAL_URL}")
+    print(f"{'='*50}\n")
 
     ExcelManager.init_excel_files()
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    # Add error handler
-    application.add_error_handler(error_handler)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            SELECTING_COUNTRY: [
-                CallbackQueryHandler(country_selected, pattern="^country_")
-            ],
+            SELECTING_COUNTRY: [CallbackQueryHandler(country_selected, pattern="^country_")],
             ENTERING_LINK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
                 CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
@@ -1640,45 +1252,38 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
     application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
     application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
-    
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("myproducts", view_my_products))
     application.add_handler(CommandHandler("history", view_price_history))
 
     # Setup job queue
     job_queue = application.job_queue
-    
-    if job_queue is not None:
-        job_queue.run_repeating(
-            monitor_prices,
-            interval=MONITORING_INTERVAL,
-            first=30  # Start monitoring after 30 seconds
-        )
-        
-        job_queue.run_repeating(
-            check_monthly_updates,
-            interval=MONTHLY_CHECK_INTERVAL,
-            first=120
-        )
+    if job_queue:
+        job_queue.run_repeating(monitor_prices, interval=MONITORING_INTERVAL, first=30)
+        job_queue.run_repeating(check_monthly_updates, interval=MONTHLY_CHECK_INTERVAL, first=120)
         print("✅ Job queue enabled!")
+
+    print("✅ BOT STARTING...\n")
+
+    # Use webhook if URL is available, otherwise use polling
+    if RENDER_EXTERNAL_URL:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{RENDER_EXTERNAL_URL}/webhook"
+        )
     else:
-        print("⚠️ Job queue not available!")
-
-    print("✅ BOT STARTING...")
-    print(f"⌨️  Press Ctrl+C to stop.\n")
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+        # Fallback to polling (for local testing)
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⛔ Bot stopped by user")
+        print("\n⛔ Bot stopped")
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
