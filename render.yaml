@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: aliexpress-price-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python aliexpress_monitor_bot.py
