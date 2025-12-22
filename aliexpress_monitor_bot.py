@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 AliExpress Price Monitor Bot - Render.com Compatible Version
+With Conflict Handling
 """
 
 import os
@@ -65,7 +66,7 @@ try:
         ContextTypes,
         filters
     )
-    from telegram.error import BadRequest
+    from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
     logger.info("✅ python-telegram-bot imported")
 except ImportError as e:
     logger.error(f"❌ Failed to import telegram: {e}")
@@ -84,7 +85,6 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# You can use environment variables or hardcode these
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8354835888:AAF_F1KR40K6nmI_RwkDPwUa74L__CNuY3s")
 ALIEXPRESS_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY", "519492")
 ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk")
@@ -142,6 +142,53 @@ def get_ssl_context():
     except Exception as e:
         logger.warning(f"Could not create SSL context with certifi: {e}")
         return ssl.create_default_context()
+
+
+async def clear_webhook_and_updates():
+    """Clear any existing webhook and pending updates before starting"""
+    logger.info("🔄 Clearing webhook and pending updates...")
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+    
+    try:
+        ssl_context = get_ssl_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                result = await response.json()
+                if result.get('ok'):
+                    logger.info("✅ Webhook cleared successfully")
+                else:
+                    logger.warning(f"⚠️ Webhook clear response: {result}")
+                return result.get('ok', False)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not clear webhook: {e}")
+        return False
+
+
+async def get_bot_info():
+    """Get bot info to verify token is valid"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    
+    try:
+        ssl_context = get_ssl_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                result = await response.json()
+                if result.get('ok'):
+                    bot_info = result.get('result', {})
+                    logger.info(f"✅ Bot verified: @{bot_info.get('username', 'unknown')}")
+                    return True
+                else:
+                    logger.error(f"❌ Invalid bot token: {result}")
+                    return False
+    except Exception as e:
+        logger.error(f"❌ Could not verify bot: {e}")
+        return False
+
 
 # ============================================================================
 # EXCEL MANAGEMENT
@@ -1169,7 +1216,7 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"🗑️ <b>Manage Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\nSelect a product to delete:\n\n"
 
     keyboard = []
-    for product in products[:10]:  # Limit to 10 products in the list
+    for product in products[:10]:
         title = product['title'][:25] + "..." if len(str(product['title'])) > 25 else product['title']
         price = product['current_price'] or 0
         keyboard.append([
@@ -1283,7 +1330,7 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = f"📊 <b>Price History - {period_text}</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     total_changes = 0
-    for product_id, data in list(history_data.items())[:5]:  # Limit to 5 products
+    for product_id, data in list(history_data.items())[:5]:
         product = data['product']
         history = data['history']
         total_changes += len(history)
@@ -1620,6 +1667,32 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
         ExcelManager.clear_update_reminder(user_id)
 
 
+# ============================================================================
+# ERROR HANDLER
+# ============================================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the dispatcher."""
+    error = context.error
+    
+    # Handle Conflict error (another instance running)
+    if isinstance(error, Conflict):
+        logger.error("="*60)
+        logger.error("❌ CONFLICT ERROR: Another bot instance is running!")
+        logger.error("Please stop all other instances of this bot.")
+        logger.error("="*60)
+        return
+    
+    # Handle network errors
+    if isinstance(error, (NetworkError, TimedOut)):
+        logger.warning(f"Network error: {error}")
+        return
+    
+    # Log other errors
+    logger.error(f"Update {update} caused error: {error}")
+    logger.error(traceback.format_exc())
+
+
 async def post_init(application):
     """Called after the application is initialized"""
     logger.info("✅ Bot initialized successfully")
@@ -1653,6 +1726,30 @@ def main():
         logger.error(traceback.format_exc())
         sys.exit(1)
 
+    # Clear webhook and pending updates BEFORE starting
+    logger.info("🔄 Clearing webhook and old updates...")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Verify bot token
+        bot_valid = loop.run_until_complete(get_bot_info())
+        if not bot_valid:
+            logger.error("❌ Invalid bot token! Please check your TELEGRAM_BOT_TOKEN")
+            sys.exit(1)
+        
+        # Clear webhook
+        loop.run_until_complete(clear_webhook_and_updates())
+        
+        # Wait for Telegram to release connections
+        logger.info("⏳ Waiting for old connections to close...")
+        time.sleep(3)
+        
+    except Exception as e:
+        logger.warning(f"Pre-start cleanup warning: {e}")
+    finally:
+        loop.close()
+
     # Build the application
     try:
         logger.info("🔧 Building application...")
@@ -1668,6 +1765,9 @@ def main():
         logger.error(f"❌ Failed to build application: {e}")
         logger.error(traceback.format_exc())
         sys.exit(1)
+
+    # Add error handler
+    application.add_error_handler(error_handler)
 
     # Create conversation handler
     conv_handler = ConversationHandler(
@@ -1713,13 +1813,13 @@ def main():
     job_queue.run_repeating(
         monitor_prices,
         interval=MONITORING_INTERVAL,
-        first=30  # Start first check after 30 seconds
+        first=30
     )
     
     job_queue.run_repeating(
         check_monthly_updates,
         interval=MONTHLY_CHECK_INTERVAL,
-        first=120  # Start monthly check after 2 minutes
+        first=120
     )
     
     logger.info("✅ Job queue configured")
@@ -1728,12 +1828,19 @@ def main():
     logger.info("🚀 BOT IS STARTING...")
     logger.info("="*60)
 
-    # Run the bot
+    # Run the bot with drop_pending_updates=True
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            close_loop=False
         )
+    except Conflict:
+        logger.error("="*60)
+        logger.error("❌ CONFLICT: Another bot instance is already running!")
+        logger.error("Please make sure only ONE instance of this bot is running.")
+        logger.error("="*60)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"❌ Bot crashed: {e}")
         logger.error(traceback.format_exc())
