@@ -20,7 +20,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # ============================================================================
 # CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
@@ -1613,8 +1613,14 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     if users_past_deadline:
         print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
 
+async def cleanup_session():
+    """Cleanup API session"""
+    global api_instance
+    if api_instance:
+        await api_instance.close_session()
+
 # ============================================================================
-# MAIN FUNCTION
+# MAIN FUNCTION WITH ERROR HANDLING FOR CLOUD DEPLOYMENT
 # ============================================================================
 
 def main():
@@ -1631,7 +1637,11 @@ def main():
 
     ExcelManager.init_excel_files()
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Create application with polling configuration for cloud deployment
+    application = Application.builder() \
+        .token(TELEGRAM_BOT_TOKEN) \
+        .concurrent_updates(True) \
+        .build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1650,6 +1660,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
+        per_message=False  # Important for cloud deployment
     )
 
     application.add_handler(conv_handler)
@@ -1684,17 +1695,31 @@ def main():
     print("✅ BOT STARTED SUCCESSFULLY!")
     print(f"⌨️  Press Ctrl+C to stop.\n")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Start polling with error handling for cloud platforms
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            timeout=30,
+            poll_interval=1.0,
+            close_loop=False
+        )
+    except Conflict as e:
+        print(f"\n❌ CONFLICT ERROR: Another bot instance is running.")
+        print("This is common when deploying to cloud platforms.")
+        print("Make sure only one instance is running.")
+        asyncio.run(cleanup_session())
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        asyncio.run(cleanup_session())
+        raise e
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
         print("\n⛔ Bot stopped by user")
-        # Cleanup
-        if api_instance:
-            asyncio.run(api_instance.close_session())
+        asyncio.run(cleanup_session())
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        if api_instance:
-            asyncio.run(api_instance.close_session())
+        asyncio.run(cleanup_session())
