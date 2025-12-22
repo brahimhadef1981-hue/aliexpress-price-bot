@@ -20,8 +20,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import BadRequest, Conflict
-import logging
+from telegram.error import BadRequest
 
 # ============================================================================
 # CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
@@ -30,12 +29,6 @@ TELEGRAM_BOT_TOKEN = "8354835888:AAF_F1KR40K6nmI_RwkDPwUa74L__CNuY3s"
 ALIEXPRESS_APP_KEY = "519492"
 ALIEXPRESS_APP_SECRET = "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk"
 ALIEXPRESS_TRACKING_ID = "hadef"
-
-# Render webhook configuration
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-WEBHOOK_PATH = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
-PORT = int(os.environ.get("PORT", 8443))
 
 # Excel files
 USERS_FILE = "users.xlsx"
@@ -62,15 +55,8 @@ MONTHLY_CHECK_INTERVAL = 86400
 # States for conversation
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
 # ============================================================================
-# EXCEL MANAGEMENT
+# EXCEL MANAGEMENT - SAME AS BEFORE
 # ============================================================================
 class ExcelManager:
     @staticmethod
@@ -789,7 +775,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
             pass
 
 # ============================================================================
-# TELEGRAM BOT HANDLERS
+# TELEGRAM BOT HANDLERS - UPDATED WITH ASYNC API
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1627,236 +1613,88 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     if users_past_deadline:
         print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
 
-async def cleanup_session():
-    """Cleanup API session"""
-    global api_instance
-    if api_instance:
-        await api_instance.close_session()
-
 # ============================================================================
-# WEBHOOK SETUP FOR RENDER DEPLOYMENT
+# MAIN FUNCTION
 # ============================================================================
 
-async def set_webhook():
-    """Set up webhook for Render"""
-    if RENDER_EXTERNAL_URL:
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Set up handlers (same as before)
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                SELECTING_COUNTRY: [
-                    CallbackQueryHandler(country_selected, pattern="^country_")
-                ],
-                ENTERING_LINK: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
-                    CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
-                    CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                    CallbackQueryHandler(view_price_history, pattern="^view_history$"),
-                    CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                    CallbackQueryHandler(help_command, pattern="^show_help$"),
-                ],
-            },
-            fallbacks=[CommandHandler("start", start)],
-            allow_reentry=True,
-        )
-
-        application.add_handler(conv_handler)
-        application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
-        application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
-        application.add_handler(CallbackQueryHandler(manage_products, pattern="^manage_products$"))
-        application.add_handler(CallbackQueryHandler(delete_product_callback, pattern="^delete_"))
-        application.add_handler(CallbackQueryHandler(view_price_history, pattern="^view_history$"))
-        application.add_handler(CallbackQueryHandler(show_price_history, pattern="^history_"))
-        application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
-        application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
-        application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
-        
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("myproducts", view_my_products))
-        application.add_handler(CommandHandler("history", view_price_history))
-
-        job_queue = application.job_queue
-        
-        job_queue.run_repeating(
-            monitor_prices,
-            interval=MONITORING_INTERVAL,
-            first=10
-        )
-        
-        job_queue.run_repeating(
-            check_monthly_updates,
-            interval=MONTHLY_CHECK_INTERVAL,
-            first=60
-        )
-        
-        await application.bot.set_webhook(WEBHOOK_URL)
-        print(f"✅ Webhook set to: {WEBHOOK_URL}")
-        return application
-    else:
-        print("❌ RENDER_EXTERNAL_URL not set. Using polling mode.")
-        return None
-
-# ============================================================================
-# MAIN FUNCTION WITH WEBHOOK SUPPORT
-# ============================================================================
-
-async def main():
-    """Start the bot with webhook support for Render"""
+def main():
+    """Start the bot"""
     print(f"\n{'='*70}")
-    print("🤖 ALIEXPRESS PRICE MONITOR BOT - WEBHOOK VERSION")
+    print("🤖 ALIEXPRESS PRICE MONITOR BOT - OPTIMIZED VERSION WITH TIMING")
     print(f"{'='*70}")
     print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
     print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
     print(f"📦 Products per cycle: {PRODUCTS_PER_CYCLE}")
-    print(f"🌐 Webhook URL: {WEBHOOK_URL if RENDER_EXTERNAL_URL else 'None (using polling)'}")
+    print(f"⏰ Request timeout: {REQUEST_TIMEOUT}s")
     print(f"{'='*70}\n")
 
     ExcelManager.init_excel_files()
 
-    if RENDER_EXTERNAL_URL:
-        # Webhook mode for Render
-        from telegram.ext import ApplicationBuilder
-        import asyncio
-        
-        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Set up handlers
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                SELECTING_COUNTRY: [
-                    CallbackQueryHandler(country_selected, pattern="^country_")
-                ],
-                ENTERING_LINK: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
-                    CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
-                    CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                    CallbackQueryHandler(view_price_history, pattern="^view_history$"),
-                    CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                    CallbackQueryHandler(help_command, pattern="^show_help$"),
-                ],
-            },
-            fallbacks=[CommandHandler("start", start)],
-            allow_reentry=True,
-        )
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-        application.add_handler(conv_handler)
-        application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
-        application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
-        application.add_handler(CallbackQueryHandler(manage_products, pattern="^manage_products$"))
-        application.add_handler(CallbackQueryHandler(delete_product_callback, pattern="^delete_"))
-        application.add_handler(CallbackQueryHandler(view_price_history, pattern="^view_history$"))
-        application.add_handler(CallbackQueryHandler(show_price_history, pattern="^history_"))
-        application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
-        application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
-        application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
-        
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("myproducts", view_my_products))
-        application.add_handler(CommandHandler("history", view_price_history))
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            SELECTING_COUNTRY: [
+                CallbackQueryHandler(country_selected, pattern="^country_")
+            ],
+            ENTERING_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
+                CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
+                CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
+                CallbackQueryHandler(view_price_history, pattern="^view_history$"),
+                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
+                CallbackQueryHandler(help_command, pattern="^show_help$"),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True,
+    )
 
-        # Set up job queue
-        job_queue = application.job_queue
-        
-        job_queue.run_repeating(
-            monitor_prices,
-            interval=MONITORING_INTERVAL,
-            first=10
-        )
-        
-        job_queue.run_repeating(
-            check_monthly_updates,
-            interval=MONTHLY_CHECK_INTERVAL,
-            first=60
-        )
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
+    application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
+    application.add_handler(CallbackQueryHandler(manage_products, pattern="^manage_products$"))
+    application.add_handler(CallbackQueryHandler(delete_product_callback, pattern="^delete_"))
+    application.add_handler(CallbackQueryHandler(view_price_history, pattern="^view_history$"))
+    application.add_handler(CallbackQueryHandler(show_price_history, pattern="^history_"))
+    application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
+    application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
+    application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
+    
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myproducts", view_my_products))
+    application.add_handler(CommandHandler("history", view_price_history))
 
-        # Set webhook
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL,
-            drop_pending_updates=True
-        )
-        print(f"✅ Webhook set to: {WEBHOOK_URL}")
-        
-        # Start webhook server
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
-            drop_pending_updates=True
-        )
-        
-    else:
-        # Fallback to polling for local development
-        print("⚠️  Running in polling mode (for local development)")
-        
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Set up handlers (same as above)
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                SELECTING_COUNTRY: [
-                    CallbackQueryHandler(country_selected, pattern="^country_")
-                ],
-                ENTERING_LINK: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
-                    CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
-                    CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                    CallbackQueryHandler(view_price_history, pattern="^view_history$"),
-                    CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                    CallbackQueryHandler(help_command, pattern="^show_help$"),
-                ],
-            },
-            fallbacks=[CommandHandler("start", start)],
-            allow_reentry=True,
-        )
+    job_queue = application.job_queue
+    
+    job_queue.run_repeating(
+        monitor_prices,
+        interval=MONITORING_INTERVAL,
+        first=10
+    )
+    
+    job_queue.run_repeating(
+        check_monthly_updates,
+        interval=MONTHLY_CHECK_INTERVAL,
+        first=60
+    )
 
-        application.add_handler(conv_handler)
-        application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
-        application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
-        application.add_handler(CallbackQueryHandler(manage_products, pattern="^manage_products$"))
-        application.add_handler(CallbackQueryHandler(delete_product_callback, pattern="^delete_"))
-        application.add_handler(CallbackQueryHandler(view_price_history, pattern="^view_history$"))
-        application.add_handler(CallbackQueryHandler(show_price_history, pattern="^history_"))
-        application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
-        application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
-        application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
-        
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("myproducts", view_my_products))
-        application.add_handler(CommandHandler("history", view_price_history))
+    print("✅ BOT STARTED SUCCESSFULLY!")
+    print(f"⌨️  Press Ctrl+C to stop.\n")
 
-        job_queue = application.job_queue
-        
-        job_queue.run_repeating(
-            monitor_prices,
-            interval=MONITORING_INTERVAL,
-            first=10
-        )
-        
-        job_queue.run_repeating(
-            check_monthly_updates,
-            interval=MONTHLY_CHECK_INTERVAL,
-            first=60
-        )
-
-        print("✅ BOT STARTED SUCCESSFULLY IN POLLING MODE!")
-        print(f"⌨️  Press Ctrl+C to stop.\n")
-        
-        await application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\n⛔ Bot stopped by user")
-        asyncio.run(cleanup_session())
+        # Cleanup
+        if api_instance:
+            asyncio.run(api_instance.close_session())
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        asyncio.run(cleanup_session())
+        if api_instance:
+            asyncio.run(api_instance.close_session())
