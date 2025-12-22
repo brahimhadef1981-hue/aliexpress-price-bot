@@ -5,12 +5,14 @@ import asyncio
 import hashlib
 import hmac
 import aiohttp
-import io
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-import openpyxl
-from openpyxl import Workbook, load_workbook
+from urllib.parse import urlparse
+import threading
+from flask import Flask, request, Response
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,29 +24,16 @@ from telegram.ext import (
     filters
 )
 from telegram.error import BadRequest
-from flask import Flask
-import threading
-import boto3
-from botocore.exceptions import ClientError
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - USE ENVIRONMENT VARIABLES FOR KOYEB
 # ============================================================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8354835888:AAF_F1KR40K6nmI_RwkDPwUa74L__CNuY3s")
-ALIEXPRESS_APP_KEY = os.environ.get("ALIEXPRESS_APP_KEY", "519492")
-ALIEXPRESS_APP_SECRET = os.environ.get("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk")
-ALIEXPRESS_TRACKING_ID = os.environ.get("ALIEXPRESS_TRACKING_ID", "hadef")
-
-# AWS S3 Configuration
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-AWS_BUCKET_NAME = os.environ.get("AWS_BUCKET_NAME", "telegram-bot-storage")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-
-# Excel files
-USERS_FILE = "users.xlsx"
-PRODUCTS_FILE = "products.xlsx"
-PRICE_HISTORY_FILE = "price_history.xlsx"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
+ALIEXPRESS_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY", "YOUR_APP_KEY")
+ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "YOUR_APP_SECRET")
+ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "YOUR_TRACKING_ID")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@host:port/db")
+PORT = int(os.getenv("PORT", 8000))
 
 # Monitoring configuration
 CONCURRENT_REQUESTS = 10
@@ -52,13 +41,9 @@ REQUEST_DELAY = 1
 MONITORING_INTERVAL = 300
 PRODUCTS_PER_CYCLE = 100
 MAX_CHECK_INTERVAL_HOURS = 24
-
-# Rate limit configuration
 RATE_LIMIT_RETRY_DELAY = 30
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 15
-
-# Monthly update configuration
 MONTHLY_UPDATE_REMINDER_DAYS = 30
 UPDATE_RESPONSE_DEADLINE_DAYS = 3
 MONTHLY_CHECK_INTERVAL = 86400
@@ -66,343 +51,463 @@ MONTHLY_CHECK_INTERVAL = 86400
 # States for conversation
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
 
-# ============================================================================
-# S3 STORAGE MANAGER
-# ============================================================================
-class S3StorageManager:
-    """Manage Excel files in AWS S3 or local storage"""
-    
-    def __init__(self):
-        self.use_s3 = bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
-        if self.use_s3:
-            try:
-                self.s3_client = boto3.client(
-                    's3',
-                    aws_access_key_id=AWS_ACCESS_KEY_ID,
-                    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                    region_name=AWS_REGION
-                )
-                self.bucket_name = AWS_BUCKET_NAME
-                # Test connection
-                self.s3_client.head_bucket(Bucket=self.bucket_name)
-                print(f"✅ Using AWS S3 storage: {self.bucket_name}")
-            except Exception as e:
-                print(f"⚠️ S3 connection failed: {e}. Falling back to local storage")
-                self.use_s3 = False
-        else:
-            print("⚠️ Using local storage (not recommended for production)")
-    
-    def download_file(self, filename: str) -> Optional[Workbook]:
-        """Download Excel file from S3 or load locally"""
-        try:
-            if self.use_s3:
-                response = self.s3_client.get_object(Bucket=self.bucket_name, Key=filename)
-                file_content = response['Body'].read()
-                return load_workbook(io.BytesIO(file_content))
-            else:
-                if os.path.exists(filename):
-                    return load_workbook(filename)
-                return None
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                return None
-            print(f"❌ Error downloading {filename}: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ Error loading {filename}: {e}")
-            return None
-    
-    def upload_file(self, workbook: Workbook, filename: str) -> bool:
-        """Upload Excel file to S3 or save locally"""
-        try:
-            if self.use_s3:
-                buffer = io.BytesIO()
-                workbook.save(buffer)
-                buffer.seek(0)
-                
-                self.s3_client.put_object(
-                    Bucket=self.bucket_name,
-                    Key=filename,
-                    Body=buffer.getvalue(),
-                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
-            else:
-                workbook.save(filename)
-            return True
-        except Exception as e:
-            print(f"❌ Error uploading {filename}: {e}")
-            return False
-    
-    def file_exists(self, filename: str) -> bool:
-        """Check if file exists in S3 or locally"""
-        try:
-            if self.use_s3:
-                self.s3_client.head_object(Bucket=self.bucket_name, Key=filename)
-                return True
-            else:
-                return os.path.exists(filename)
-        except ClientError:
-            return False
-        except Exception:
-            return False
+# Flask app for health checks
+flask_app = Flask(__name__)
 
-storage = S3StorageManager()
+@flask_app.route('/')
+def home():
+    return Response("Bot is running!", status=200)
+
+@flask_app.route('/health')
+def health():
+    return Response("OK", status=200)
 
 # ============================================================================
-# EXCEL MANAGEMENT
+# DATABASE MANAGER - REPLACES EXCEL WITH POSTGRESQL
 # ============================================================================
-class ExcelManager:
+class DatabaseManager:
+    _pool = None
+    
+    @classmethod
+    def get_pool(cls):
+        if cls._pool is None:
+            cls._pool = pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=10,
+                dsn=DATABASE_URL
+            )
+        return cls._pool
+    
+    @classmethod
+    def get_connection(cls):
+        return cls.get_pool().getconn()
+    
+    @classmethod
+    def release_connection(cls, conn):
+        cls.get_pool().putconn(conn)
+    
     @staticmethod
-    def init_excel_files():
-        """Initialize Excel files if they don't exist"""
-        if not storage.file_exists(USERS_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Users"
-            ws.append(["User ID", "Username", "Country", "Date Added", "Last Update Reminder", 
-                      "Update Deadline", "Needs Update Response"])
-            storage.upload_file(wb, USERS_FILE)
-            print(f"✅ Created {USERS_FILE}")
-
-        if not storage.file_exists(PRODUCTS_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Products"
-            ws.append(["User ID", "Product ID", "Product URL", "Title", "Current Price", 
-                      "Original Price", "Currency", "Image URL", "Country", "Date Added", "Last Checked"])
-            storage.upload_file(wb, PRODUCTS_FILE)
-            print(f"✅ Created {PRODUCTS_FILE}")
-        
-        if not storage.file_exists(PRICE_HISTORY_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Price History"
-            ws.append(["User ID", "Product ID", "Product Title", "Old Price", "New Price", 
-                      "Change Amount", "Change Percent", "Currency", "Date"])
-            storage.upload_file(wb, PRICE_HISTORY_FILE)
-            print(f"✅ Created {PRICE_HISTORY_FILE}")
+    def init_database():
+        """Initialize database tables"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                # Users table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        username VARCHAR(255),
+                        country VARCHAR(10),
+                        date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_update_reminder TIMESTAMP,
+                        update_deadline TIMESTAMP,
+                        needs_update_response BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                
+                # Products table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS products (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        product_id VARCHAR(50),
+                        product_url TEXT,
+                        title TEXT,
+                        current_price DECIMAL(10,2),
+                        original_price DECIMAL(10,2),
+                        currency VARCHAR(10),
+                        image_url TEXT,
+                        country VARCHAR(10),
+                        date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_checked TIMESTAMP,
+                        UNIQUE(user_id, product_id)
+                    )
+                """)
+                
+                # Price history table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS price_history (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        product_id VARCHAR(50),
+                        product_title TEXT,
+                        old_price DECIMAL(10,2),
+                        new_price DECIMAL(10,2),
+                        change_amount DECIMAL(10,2),
+                        change_percent DECIMAL(10,2),
+                        currency VARCHAR(10),
+                        date_recorded TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Create indexes for better performance
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_last_checked ON products(last_checked)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_history_user_product ON price_history(user_id, product_id)")
+                
+                conn.commit()
+                print("✅ Database tables initialized")
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error initializing database: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def save_user(user_id: int, username: str, country: str):
-        """Save or update user in Excel"""
+        """Save or update user"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(USERS_FILE)
-            if not wb:
-                ExcelManager.init_excel_files()
-                wb = storage.download_file(USERS_FILE)
-            
-            ws = wb.active
-            user_exists = False
-            for row in ws.iter_rows(min_row=2, max_col=7):
-                if row[0].value == user_id:
-                    row[2].value = country
-                    user_exists = True
-                    break
-            
-            if not user_exists:
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ws.append([user_id, username, country, now, "", "", "No"])
-            
-            storage.upload_file(wb, USERS_FILE)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (user_id, username, country)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) 
+                    DO UPDATE SET country = EXCLUDED.country, username = EXCLUDED.username
+                """, (user_id, username, country))
+                conn.commit()
         except Exception as e:
+            conn.rollback()
             print(f"❌ Error saving user: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def get_user_country(user_id: int) -> Optional[str]:
         """Get user's current country"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(USERS_FILE)
-            if not wb:
-                return None
-            ws = wb.active
-            for row in ws.iter_rows(min_row=2, max_col=3):
-                if row[0].value == user_id:
-                    return row[2].value
+            with conn.cursor() as cur:
+                cur.execute("SELECT country FROM users WHERE user_id = %s", (user_id,))
+                result = cur.fetchone()
+                return result[0] if result else None
         except Exception as e:
             print(f"❌ Error getting user country: {e}")
-        return None
+            return None
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def update_user_products_country(user_id: int, new_country: str):
+    def update_user_products_country(user_id: int, new_country: str) -> int:
         """Update country for all products of a user"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRODUCTS_FILE)
-            if not wb:
-                return 0
-            ws = wb.active
-            updated_count = 0
-            for row in ws.iter_rows(min_row=2):
-                if row[0].value == user_id:
-                    row[8].value = new_country
-                    updated_count += 1
-            storage.upload_file(wb, PRODUCTS_FILE)
-            return updated_count
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE products SET country = %s WHERE user_id = %s
+                """, (new_country, user_id))
+                updated = cur.rowcount
+                conn.commit()
+                return updated
         except Exception as e:
+            conn.rollback()
             print(f"❌ Error updating products country: {e}")
             return 0
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def save_product(user_id: int, product_id: str, product_url: str, title: str, 
+    def save_product(user_id: int, product_id: str, product_url: str, title: str,
                     price: float, original_price: float, currency: str, image_url: str, country: str):
-        """Save product to Excel"""
+        """Save product to database"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRODUCTS_FILE)
-            if not wb:
-                ExcelManager.init_excel_files()
-                wb = storage.download_file(PRODUCTS_FILE)
-            ws = wb.active
-            product_exists = False
-            for row in ws.iter_rows(min_row=2):
-                if row[0].value == user_id and row[1].value == product_id:
-                    row[2].value = product_url
-                    row[4].value = price
-                    row[5].value = original_price
-                    row[8].value = country
-                    row[10].value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    product_exists = True
-                    break
-            if not product_exists:
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ws.append([user_id, product_id, product_url, title, price, original_price, 
-                          currency, image_url, country, now, now])
-            storage.upload_file(wb, PRODUCTS_FILE)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO products (user_id, product_id, product_url, title, current_price,
+                                         original_price, currency, image_url, country, last_checked)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id, product_id) 
+                    DO UPDATE SET 
+                        product_url = EXCLUDED.product_url,
+                        current_price = EXCLUDED.current_price,
+                        original_price = EXCLUDED.original_price,
+                        country = EXCLUDED.country,
+                        last_checked = CURRENT_TIMESTAMP
+                """, (user_id, product_id, product_url, title, price, original_price, 
+                      currency, image_url, country))
+                conn.commit()
         except Exception as e:
+            conn.rollback()
             print(f"❌ Error saving product: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def get_all_products() -> List[Dict]:
         """Get all products for monitoring"""
-        products = []
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRODUCTS_FILE)
-            if not wb:
-                return products
-            ws = wb.active
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[0]:
-                    products.append({
-                        'user_id': row[0], 'product_id': row[1], 'product_url': row[2],
-                        'title': row[3], 'current_price': row[4], 'original_price': row[5],
-                        'currency': row[6], 'image_url': row[7], 'country': row[8],
-                        'date_added': row[9], 'last_checked': row[10]
-                    })
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, product_id, product_url, title, current_price,
+                           original_price, currency, image_url, country, date_added, last_checked
+                    FROM products
+                """)
+                return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             print(f"❌ Error getting products: {e}")
-        return products
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def get_products_to_check(limit: int) -> List[Dict]:
-        """Get products that need to be checked"""
-        all_products = ExcelManager.get_all_products()
-        if not all_products:
-            return []
-        def get_last_checked_time(product):
-            last_checked = product.get('last_checked')
-            if not last_checked or last_checked == 'Never' or last_checked == '':
-                return datetime.min
-            try:
-                return datetime.strptime(str(last_checked), "%Y-%m-%d %H:%M:%S")
-            except:
-                return datetime.min
-        sorted_products = sorted(all_products, key=get_last_checked_time)
-        return sorted_products[:limit]
-
-    @staticmethod
-    def update_product_price(user_id: int, product_id: str, new_price: float, country: str = None, product_url: str = None):
-        """Update product price and last checked time"""
+        """Get products that need to be checked, ordered by last_checked"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRODUCTS_FILE)
-            if not wb:
-                return
-            ws = wb.active
-            for row in ws.iter_rows(min_row=2):
-                if row[0].value == user_id and row[1].value == product_id:
-                    if product_url:
-                        row[2].value = product_url
-                    row[4].value = new_price
-                    if country:
-                        row[8].value = country
-                    row[10].value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    break
-            storage.upload_file(wb, PRODUCTS_FILE)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, product_id, product_url, title, current_price,
+                           original_price, currency, image_url, country, date_added, last_checked
+                    FROM products
+                    ORDER BY last_checked ASC NULLS FIRST
+                    LIMIT %s
+                """, (limit,))
+                return [dict(row) for row in cur.fetchall()]
         except Exception as e:
-            print(f"❌ Error updating product price: {e}")
+            print(f"❌ Error getting products to check: {e}")
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
-    def save_price_change(user_id: int, product_id: str, title: str, old_price: float, 
+    def update_product_price(user_id: int, product_id: str, new_price: float, 
+                            country: str = None, product_url: str = None):
+        """Update product price and last checked time"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                if product_url and country:
+                    cur.execute("""
+                        UPDATE products 
+                        SET current_price = %s, country = %s, product_url = %s, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND product_id = %s
+                    """, (new_price, country, product_url, user_id, product_id))
+                elif country:
+                    cur.execute("""
+                        UPDATE products 
+                        SET current_price = %s, country = %s, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND product_id = %s
+                    """, (new_price, country, user_id, product_id))
+                else:
+                    cur.execute("""
+                        UPDATE products 
+                        SET current_price = %s, last_checked = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND product_id = %s
+                    """, (new_price, user_id, product_id))
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error updating product price: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def save_price_change(user_id: int, product_id: str, title: str, old_price: float,
                          new_price: float, currency: str):
         """Save price change to history"""
+        if abs(new_price - old_price) < 0.01:
+            return
+        
+        conn = DatabaseManager.get_connection()
         try:
-            if abs(new_price - old_price) < 0.01:
-                return
-            wb = storage.download_file(PRICE_HISTORY_FILE)
-            if not wb:
-                ExcelManager.init_excel_files()
-                wb = storage.download_file(PRICE_HISTORY_FILE)
-            ws = wb.active
             change = new_price - old_price
             change_percent = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0
-            ws.append([user_id, product_id, title, old_price, new_price, round(change, 2),
-                      round(change_percent, 2), currency, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-            storage.upload_file(wb, PRICE_HISTORY_FILE)
-            print(f"✅ Price change: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
+            
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO price_history (user_id, product_id, product_title, old_price,
+                                              new_price, change_amount, change_percent, currency)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (user_id, product_id, title, old_price, new_price, 
+                      round(change, 2), round(change_percent, 2), currency))
+                conn.commit()
+                print(f"✅ Price change archived: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
         except Exception as e:
+            conn.rollback()
             print(f"❌ Error saving price change: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def get_user_products(user_id: int) -> List[Dict]:
         """Get all products for a specific user"""
-        all_products = ExcelManager.get_all_products()
-        return [p for p in all_products if p['user_id'] == user_id]
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, product_id, product_url, title, current_price,
+                           original_price, currency, image_url, country, date_added, last_checked
+                    FROM products WHERE user_id = %s
+                """, (user_id,))
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"❌ Error getting user products: {e}")
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def delete_product(user_id: int, product_id: str) -> bool:
         """Delete a product from monitoring"""
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRODUCTS_FILE)
-            if not wb:
-                return False
-            ws = wb.active
-            rows_to_delete = []
-            for idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
-                if row[0].value == user_id and row[1].value == product_id:
-                    rows_to_delete.append(idx)
-            for row_idx in reversed(rows_to_delete):
-                ws.delete_rows(row_idx)
-            storage.upload_file(wb, PRODUCTS_FILE)
-            return True
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE user_id = %s AND product_id = %s", 
+                           (user_id, product_id))
+                conn.commit()
+                return True
         except Exception as e:
+            conn.rollback()
             print(f"❌ Error deleting product: {e}")
             return False
+        finally:
+            DatabaseManager.release_connection(conn)
 
     @staticmethod
     def get_price_history(user_id: int, product_id: str, months: int = None) -> List[Dict]:
         """Get price history for a product"""
-        history = []
+        conn = DatabaseManager.get_connection()
         try:
-            wb = storage.download_file(PRICE_HISTORY_FILE)
-            if not wb:
-                return history
-            ws = wb.active
-            cutoff_date = None
-            if months:
-                cutoff_date = datetime.now() - timedelta(days=months * 30)
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[0] == user_id and row[1] == product_id:
-                    record_date = datetime.strptime(str(row[8]), "%Y-%m-%d %H:%M:%S")
-                    if cutoff_date and record_date < cutoff_date:
-                        continue
-                    history.append({
-                        'title': row[2], 'old_price': row[3], 'new_price': row[4],
-                        'change_amount': row[5], 'change_percent': row[6],
-                        'currency': row[7], 'date': row[8]
-                    })
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if months:
+                    cur.execute("""
+                        SELECT product_title as title, old_price, new_price, change_amount,
+                               change_percent, currency, date_recorded as date
+                        FROM price_history
+                        WHERE user_id = %s AND product_id = %s
+                        AND date_recorded >= CURRENT_TIMESTAMP - INTERVAL '%s months'
+                        ORDER BY date_recorded DESC
+                    """, (user_id, product_id, months))
+                else:
+                    cur.execute("""
+                        SELECT product_title as title, old_price, new_price, change_amount,
+                               change_percent, currency, date_recorded as date
+                        FROM price_history
+                        WHERE user_id = %s AND product_id = %s
+                        ORDER BY date_recorded DESC
+                    """, (user_id, product_id))
+                return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             print(f"❌ Error getting price history: {e}")
-        return sorted(history, key=lambda x: x['date'], reverse=True)
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def get_all_user_price_history(user_id: int, months: int = None) -> Dict[str, List[Dict]]:
+        """Get price history for all products of a user"""
+        products = DatabaseManager.get_user_products(user_id)
+        history_by_product = {}
+        
+        for product in products:
+            history = DatabaseManager.get_price_history(user_id, product['product_id'], months)
+            if history:
+                history_by_product[product['product_id']] = {
+                    'product': product,
+                    'history': history
+                }
+        
+        return history_by_product
+
+    @staticmethod
+    def set_update_reminder(user_id: int):
+        """Set monthly update reminder for user"""
+        conn = DatabaseManager.get_connection()
+        try:
+            deadline = datetime.now() + timedelta(days=UPDATE_RESPONSE_DEADLINE_DAYS)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_update_reminder = CURRENT_TIMESTAMP,
+                        update_deadline = %s,
+                        needs_update_response = TRUE
+                    WHERE user_id = %s
+                """, (deadline, user_id))
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error setting update reminder: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def clear_update_reminder(user_id: int):
+        """Clear update reminder after user responds"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_update_reminder = CURRENT_TIMESTAMP,
+                        update_deadline = NULL,
+                        needs_update_response = FALSE
+                    WHERE user_id = %s
+                """, (user_id,))
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error clearing update reminder: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def get_users_needing_reminder() -> List[int]:
+        """Get users who need monthly update reminder"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id FROM users
+                    WHERE last_update_reminder IS NULL
+                    OR last_update_reminder < CURRENT_TIMESTAMP - INTERVAL '%s days'
+                """, (MONTHLY_UPDATE_REMINDER_DAYS,))
+                return [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            print(f"❌ Error getting users needing reminder: {e}")
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def get_users_past_deadline() -> List[int]:
+        """Get users who didn't respond and are past deadline"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id FROM users
+                    WHERE needs_update_response = TRUE
+                    AND update_deadline < CURRENT_TIMESTAMP
+                """)
+                return [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            print(f"❌ Error getting users past deadline: {e}")
+            return []
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def delete_all_user_data(user_id: int):
+        """Delete all products and price history for a user"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE user_id = %s", (user_id,))
+                cur.execute("DELETE FROM price_history WHERE user_id = %s", (user_id,))
+                conn.commit()
+                print(f"✅ Deleted all data for user {user_id}")
+                return True
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error deleting user data: {e}")
+            return False
+        finally:
+            DatabaseManager.release_connection(conn)
 
 # ============================================================================
-# ALIEXPRESS API
+# ASYNC ALIEXPRESS API CLIENT
 # ============================================================================
 class AliExpressAPI:
     def __init__(self, app_key: str, app_secret: str, tracking_id: str):
@@ -414,14 +519,12 @@ class AliExpressAPI:
         self.session = None
 
     async def get_session(self):
-        """Get or create aiohttp session"""
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
             self.session = aiohttp.ClientSession(connector=connector, timeout=self.timeout)
         return self.session
 
     async def close_session(self):
-        """Close aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -438,8 +541,7 @@ class AliExpressAPI:
 
     @staticmethod
     def extract_product_id(url: str) -> Optional[str]:
-        patterns = [r"/item/(\d+)\.html", r"/i/(\d+)\.html", r"/(\d+)\.html", r"item/(\d+)", 
-                   r"/goods/(\d+)", r"product/(\d+)", r"/dp/(\d+)"]
+        patterns = [r"/item/(\d+)\.html", r"/i/(\d+)\.html", r"/(\d+)\.html", r"item/(\d+)", r"/goods/(\d+)", r"product/(\d+)", r"/dp/(\d+)"]
         for p in patterns:
             m = re.search(p, url)
             if m:
@@ -451,9 +553,9 @@ class AliExpressAPI:
         return f"https://www.aliexpress.com/item/{product_id}.html"
 
     async def resolve_shortened_url(self, url: str, max_retries: int = 3) -> str:
-        """Async URL resolver"""
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         session = await self.get_session()
+        
         for attempt in range(max_retries):
             try:
                 async with session.head(url, allow_redirects=True, headers=headers) as response:
@@ -474,13 +576,13 @@ class AliExpressAPI:
 
     @staticmethod
     def is_rate_limited(error_msg: str) -> bool:
-        patterns = ["frequency exceeds the limit", "rate limit", "too many requests"]
-        return any(pattern in error_msg.lower() for pattern in patterns)
+        rate_limit_patterns = ["frequency exceeds the limit", "rate limit", "too many requests"]
+        return any(pattern in error_msg.lower() for pattern in rate_limit_patterns)
 
     async def get_product_details(self, product_id: str, country: str = "US", retry_count: int = 0) -> Dict[str, Any]:
-        """Async product details fetcher"""
         start_time = time.time()
         method = "aliexpress.affiliate.productdetail.get"
+        
         params = {
             "app_key": self.app_key, "format": "json", "method": method, "sign_method": "hmac",
             "timestamp": self._now_ms(), "v": "2.0", "tracking_id": self.tracking_id,
@@ -488,11 +590,13 @@ class AliExpressAPI:
         }
         params["sign"] = self.generate_signature(params)
         session = await self.get_session()
+        
         try:
             async with session.get(self.api_url, params=params) as response:
                 response.raise_for_status()
                 data = await response.json()
                 elapsed_time = time.time() - start_time
+                
                 if "error_response" in data:
                     error_msg = data["error_response"].get("msg", "API Error")
                     if self.is_rate_limited(error_msg) and retry_count < MAX_RETRIES:
@@ -500,50 +604,45 @@ class AliExpressAPI:
                         await asyncio.sleep(wait_time)
                         return await self.get_product_details(product_id, country, retry_count + 1)
                     return {"success": False, "error": error_msg, "time_taken": elapsed_time}
-                resp_key = None
-                for k in data.keys():
-                    if k.endswith("_response"):
-                        resp_key = k
-                        break
+                
+                resp_key = next((k for k in data.keys() if k.endswith("_response")), None)
                 if not resp_key:
                     return {"success": False, "error": "Invalid response", "time_taken": elapsed_time}
-                resp_data = data[resp_key]
-                result = resp_data.get("resp_result", {}).get("result", {})
+                
+                result = data[resp_key].get("resp_result", {}).get("result", {})
                 products = result.get("products", {}).get("product", [])
+                
                 if not products:
                     return {"success": False, "error": "Product not found", "time_taken": elapsed_time}
+                
                 product = products[0] if isinstance(products, list) else products
                 sale_price = product.get("target_sale_price") or product.get("sale_price")
                 original_price = product.get("target_original_price") or product.get("original_price")
+                
                 def to_float(val):
-                    if val is None:
-                        return None
+                    if val is None: return None
                     try:
-                        price_str = str(val).replace("USD", "").replace("$", "").replace(",", "").strip()
-                        return float(price_str)
-                    except:
-                        return None
+                        return float(str(val).replace("USD", "").replace("$", "").replace(",", "").strip())
+                    except: return None
+                
                 current_price = to_float(sale_price)
-                orig_price = to_float(original_price)
                 if current_price is None:
                     return {"success": False, "error": "No price available", "time_taken": elapsed_time}
-                product_url = self.build_product_url(str(product.get("product_id", product_id)))
+                
                 return {
                     "success": True, "product_id": str(product.get("product_id", product_id)),
                     "title": product.get("product_title", "N/A"), "price": current_price,
-                    "original_price": orig_price or current_price, "currency": "USD",
-                    "image_url": product.get("product_main_image_url", ""), "product_url": product_url,
+                    "original_price": to_float(original_price) or current_price, "currency": "USD",
+                    "image_url": product.get("product_main_image_url", ""),
+                    "product_url": self.build_product_url(str(product.get("product_id", product_id))),
                     "time_taken": elapsed_time
                 }
         except asyncio.TimeoutError:
-            elapsed_time = time.time() - start_time
-            return {"success": False, "error": "Request timeout", "time_taken": elapsed_time}
+            return {"success": False, "error": "Request timeout", "time_taken": time.time() - start_time}
         except Exception as e:
-            elapsed_time = time.time() - start_time
-            return {"success": False, "error": str(e), "time_taken": elapsed_time}
+            return {"success": False, "error": str(e), "time_taken": time.time() - start_time}
 
     async def generate_affiliate_link(self, product_url: str, country: str = "US") -> Optional[str]:
-        """Async affiliate link generator"""
         method = "aliexpress.affiliate.link.generate"
         params = {
             "app_key": self.app_key, "format": "json", "method": method, "sign_method": "hmac",
@@ -552,6 +651,7 @@ class AliExpressAPI:
         }
         params["sign"] = self.generate_signature(params)
         session = await self.get_session()
+        
         try:
             async with session.post(self.api_url, data=params) as response:
                 data = await response.json()
@@ -567,10 +667,10 @@ class AliExpressAPI:
         except Exception:
             return product_url
 
+# Global API instance
 api_instance = None
 
 async def get_api_instance():
-    """Get or create global API instance"""
     global api_instance
     if api_instance is None:
         api_instance = AliExpressAPI(ALIEXPRESS_APP_KEY, ALIEXPRESS_APP_SECRET, ALIEXPRESS_TRACKING_ID)
@@ -580,64 +680,66 @@ async def get_api_instance():
 # HELPER FUNCTIONS
 # ============================================================================
 async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
-    """Safely edit message or send new one if editing fails"""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest:
         try:
             await query.message.delete()
-        except:
-            pass
+        except: pass
         await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
         print(f"Error editing message: {e}")
         try:
             await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except:
-            pass
+        except: pass
 
 # ============================================================================
 # TELEGRAM BOT HANDLERS
 # ============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     user = update.effective_user
-    user_id = user.id
-    username = user.username or user.first_name
     keyboard = [
         [InlineKeyboardButton("🇫🇷 France", callback_data="country_FR"),
          InlineKeyboardButton("🇮🇹 Italy", callback_data="country_IT")],
         [InlineKeyboardButton("🇺🇸 United States", callback_data="country_US")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
     welcome_text = (
-        f"👋 <b>Welcome {username}!</b>\n\n🛍️ <b>AliExpress Price Monitor Bot</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\nI will help you track AliExpress product prices and notify you of changes!\n\n"
+        f"👋 <b>Welcome {user.first_name}!</b>\n\n"
+        "🛍️ <b>AliExpress Price Monitor Bot</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "I will help you track AliExpress product prices!\n\n"
         "📍 <b>Please select your country:</b>"
     )
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='HTML')
     return SELECTING_COUNTRY
 
 async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle country selection"""
     query = update.callback_query
     await query.answer()
+    
     country = query.data.split("_")[1]
     user = update.effective_user
-    user_id = user.id
-    username = user.username or user.first_name
-    ExcelManager.save_user(user_id, username, country)
-    updated_count = ExcelManager.update_user_products_country(user_id, country)
+    
+    DatabaseManager.save_user(user.id, user.username or user.first_name, country)
+    updated_count = DatabaseManager.update_user_products_country(user.id, country)
     context.user_data['country'] = country
+    
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
     message = f"✅ <b>Country Selected: {country_flags.get(country, '')} {country}</b>\n\n"
+    
     if updated_count > 0:
         message += f"🔄 Updated {updated_count} existing products\n\n"
+    
     message += (
-        "📎 <b>Now send me an AliExpress product link:</b>\n\n<i>Supported formats:</i>\n"
+        "📎 <b>Now send me an AliExpress product link:</b>\n\n"
+        "<i>Supported formats:</i>\n"
         "• <code>https://www.aliexpress.com/item/xxxxx.html</code>\n"
-        "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n💡 Or use the menu below:"
+        "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n"
+        "💡 Or use the menu below:"
     )
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
@@ -649,14 +751,17 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ENTERING_LINK
 
 async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show prompt to add a product"""
     query = update.callback_query
     await query.answer()
+    
     message = (
-        "📎 <b>Send me an AliExpress product link:</b>\n\n<i>Supported formats:</i>\n"
+        "📎 <b>Send me an AliExpress product link:</b>\n\n"
+        "<i>Supported formats:</i>\n"
         "• <code>https://www.aliexpress.com/item/xxxxx.html</code>\n"
-        "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n💡 Just paste the link and send it to me!"
+        "• <code>https://s.click.aliexpress.com/e/_xxxxx</code>\n\n"
+        "💡 Just paste the link and send it to me!"
     )
+    
     keyboard = [
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
@@ -666,84 +771,90 @@ async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ENTERING_LINK
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle product link submission"""
     if not update.message or not update.message.text:
         return ENTERING_LINK
+    
     total_start_time = time.time()
     user_id = update.effective_user.id
     product_url = update.message.text.strip()
+    
     if "aliexpress" not in product_url.lower():
         keyboard = [
             [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
             [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             "❌ <b>Invalid Link</b>\n\nPlease send a valid AliExpress product link.",
-            reply_markup=reply_markup, parse_mode='HTML'
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
+    
     processing_msg = await update.message.reply_text("⏳ Processing...")
-    country = ExcelManager.get_user_country(user_id) or "US"
+    country = DatabaseManager.get_user_country(user_id) or "US"
     api = await get_api_instance()
-    url_start = time.time()
+    
     if api.is_shortened_url(product_url):
         await processing_msg.edit_text("🔗 Resolving shortened URL...")
         product_url = await api.resolve_shortened_url(product_url)
-    url_time = time.time() - url_start
+    
     product_id = api.extract_product_id(product_url)
+    
     if not product_id:
         keyboard = [
             [InlineKeyboardButton("➕ Try Again", callback_data="add_product")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await processing_msg.edit_text(
             "❌ <b>Could not extract product ID</b>\n\nPlease send a valid AliExpress link.",
-            reply_markup=reply_markup, parse_mode='HTML'
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
+    
     await processing_msg.edit_text("📊 Fetching product details...")
     result = await api.get_product_details(product_id, country)
     api_time = result.get('time_taken', 0)
+    
     if not result.get("success"):
         keyboard = [
             [InlineKeyboardButton("➕ Try Another", callback_data="add_product")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await processing_msg.edit_text(
             f"❌ <b>Cannot monitor this product</b>\n\n<b>Reason:</b> {result.get('error')}\n"
-            f"<b>Time taken:</b> {api_time:.2f}s\n\n💡 Try another product or check back later.",
-            reply_markup=reply_markup, parse_mode='HTML'
+            f"<b>Time taken:</b> {api_time:.2f}s\n\n💡 Try another product.",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return ENTERING_LINK
-    affiliate_start = time.time()
+    
     affiliate_link = await api.generate_affiliate_link(result['product_url'], country)
-    affiliate_time = time.time() - affiliate_start
-    save_start = time.time()
-    ExcelManager.save_product(
-        user_id=user_id, product_id=product_id, product_url=affiliate_link, title=result['title'],
-        price=result['price'], original_price=result['original_price'], currency=result['currency'],
-        image_url=result['image_url'], country=country
+    
+    DatabaseManager.save_product(
+        user_id=user_id, product_id=product_id, product_url=affiliate_link,
+        title=result['title'], price=result['price'], original_price=result['original_price'],
+        currency=result['currency'], image_url=result['image_url'], country=country
     )
-    save_time = time.time() - save_start
+    
     total_time = time.time() - total_start_time
     discount = result['original_price'] - result['price']
     discount_percent = (discount / result['original_price'] * 100) if result['original_price'] > 0 else 0
+    
     message = (
         "✅ <b>Product Added Successfully!</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>{result['title'][:80]}...</b>\n\n💵 <b>Current:</b> ${result['price']:.2f}\n"
+        f"📦 <b>{result['title'][:80]}...</b>\n\n"
+        f"💵 <b>Current:</b> ${result['price']:.2f}\n"
         f"💰 <b>Original:</b> ${result['original_price']:.2f}\n"
     )
+    
     if discount > 0:
         message += f"🏷️ <b>Discount:</b> ${discount:.2f} ({discount_percent:.1f}% OFF)\n"
+    
     message += (
         f"🌍 <b>Country:</b> {country}\n🆔 <b>ID:</b> {product_id}\n\n"
-        f"⏱️ <b>Processing Time:</b>\n   • API call: {api_time:.2f}s\n   • Total: {total_time:.2f}s\n\n"
+        f"⏱️ <b>Processing Time:</b> {total_time:.2f}s\n\n"
         f"🔔 <b>Price monitoring active!</b>\n\n🔗 <code>{affiliate_link}</code>"
     )
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add Another Product", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
@@ -751,515 +862,463 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
     if result.get('image_url'):
         try:
             await update.message.reply_photo(
-                photo=result['image_url'], caption=message, reply_markup=reply_markup, parse_mode='HTML'
+                photo=result['image_url'], caption=message,
+                reply_markup=reply_markup, parse_mode='HTML'
             )
             await processing_msg.delete()
         except:
             await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
     else:
         await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
-    print(f"   ⏱️ Product {product_id} added - API: {api_time:.2f}s, Total: {total_time:.2f}s")
+    
     return ENTERING_LINK
 
 async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's products"""
     query = update.callback_query
     if query:
         await query.answer()
+    
     user_id = update.effective_user.id
-    products = ExcelManager.get_user_products(user_id)
+    products = DatabaseManager.get_user_products(user_id)
+    
     if not products:
         keyboard = [
             [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        message = (
-            "📭 <b>No Products Yet</b>\n\nYou haven't added any products to monitor.\n\n"
-            "Click 'Add Product' to start tracking prices!"
-        )
+        message = "📭 <b>No Products Yet</b>\n\nYou haven't added any products to monitor."
         if query:
-            await safe_edit_message(query, message, reply_markup)
+            await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
         else:
-            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
-        return MANAGING_PRODUCTS
-    message = f"📋 <b>Your Monitored Products ({len(products)})</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for idx, product in enumerate(products[:10], 1):
+            await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return
+    
+    message = f"📦 <b>Your Monitored Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    for i, product in enumerate(products[:5], 1):
         title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
-        price = product['current_price']
-        original_price = product['original_price']
-        discount = original_price - price
-        discount_percent = (discount / original_price * 100) if original_price > 0 else 0
-        message += f"<b>{idx}. {title}</b>\n"
-        message += f"💵 Current: ${price:.2f}"
-        if discount > 0:
-            message += f" ({discount_percent:.0f}% OFF)"
-        message += f"\n🆔 ID: <code>{product['product_id']}</code>\n\n"
-    if len(products) > 10:
-        message += f"<i>... and {len(products) - 10} more products</i>\n\n"
-    message += "💡 <b>Select a product to manage:</b>"
+        message += f"{i}. <b>{title}</b>\n   💵 ${float(product['current_price']):.2f}\n   🌍 {product['country']}\n\n"
+    
+    if len(products) > 5:
+        message += f"<i>...and {len(products) - 5} more</i>\n\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+        [InlineKeyboardButton("🗑️ Manage Products", callback_data="manage_products")],
+        [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+    ]
+    
+    if query:
+        await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    products = DatabaseManager.get_user_products(user_id)
+    
+    message = f"🗑️ <b>Manage Products ({len(products)}):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\nSelect a product to delete:\n\n"
+    
     keyboard = []
-    for product in products[:10]:
+    for product in products:
         title = product['title'][:30] + "..." if len(product['title']) > 30 else product['title']
         keyboard.append([InlineKeyboardButton(
-            f"📦 {title}", callback_data=f"manage_{product['product_id']}"
+            f"❌ {title} - ${float(product['current_price']):.2f}",
+            callback_data=f"delete_{product['product_id']}"
         )])
+    
     keyboard.append([InlineKeyboardButton("➕ Add Product", callback_data="add_product")])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if query:
-        await safe_edit_message(query, message, reply_markup)
-    else:
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
-    return MANAGING_PRODUCTS
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="view_myproducts")])
+    
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
 
-async def manage_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show product management options"""
+async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    product_id = query.data.split("_")[1]
+    
+    product_id = query.data.split("_", 1)[1]
     user_id = update.effective_user.id
-    products = ExcelManager.get_user_products(user_id)
-    product = next((p for p in products if p['product_id'] == product_id), None)
-    if not product:
-        await query.edit_message_text("❌ Product not found")
-        return MANAGING_PRODUCTS
-    title = product['title']
-    price = product['current_price']
-    original_price = product['original_price']
-    discount = original_price - price
-    discount_percent = (discount / original_price * 100) if original_price > 0 else 0
-    last_checked = product.get('last_checked', 'Never')
-    message = (
-        f"📦 <b>{title[:60]}...</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💵 <b>Current Price:</b> ${price:.2f}\n"
-        f"💰 <b>Original Price:</b> ${original_price:.2f}\n"
-    )
-    if discount > 0:
-        message += f"🏷️ <b>Discount:</b> ${discount:.2f} ({discount_percent:.1f}% OFF)\n"
-    message += (
-        f"🌍 <b>Country:</b> {product['country']}\n"
-        f"🆔 <b>Product ID:</b> <code>{product_id}</code>\n"
-        f"🕐 <b>Last Checked:</b> {last_checked}\n\n"
-        f"🔗 <code>{product['product_url']}</code>\n\n"
-        f"<b>What would you like to do?</b>"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🔄 Check Price Now", callback_data=f"check_{product_id}")],
-        [InlineKeyboardButton("📊 View History", callback_data=f"history_{product_id}")],
-        [InlineKeyboardButton("🗑️ Delete Product", callback_data=f"delete_{product_id}")],
-        [InlineKeyboardButton("📋 Back to Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_menu")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if product.get('image_url'):
-        try:
-            await query.message.delete()
-            await query.message.reply_photo(
-                photo=product['image_url'], caption=message, reply_markup=reply_markup, parse_mode='HTML'
-            )
-            return MANAGING_PRODUCTS
-        except:
-            pass
-    await safe_edit_message(query, message, reply_markup)
-    return MANAGING_PRODUCTS
-
-async def check_price_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check product price immediately"""
-    query = update.callback_query
-    await query.answer("Checking price...")
-    product_id = query.data.split("_")[1]
-    user_id = update.effective_user.id
-    products = ExcelManager.get_user_products(user_id)
-    product = next((p for p in products if p['product_id'] == product_id), None)
-    if not product:
-        await query.edit_message_text("❌ Product not found")
-        return MANAGING_PRODUCTS
-    await query.edit_message_text("⏳ Checking current price...")
-    api = await get_api_instance()
-    result = await api.get_product_details(product_id, product['country'])
-    if not result.get('success'):
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"manage_{product_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            f"❌ <b>Failed to check price</b>\n\n<b>Error:</b> {result.get('error')}",
-            reply_markup=reply_markup, parse_mode='HTML'
-        )
-        return MANAGING_PRODUCTS
-    new_price = result['price']
-    old_price = product['current_price']
-    price_change = new_price - old_price
-    change_percent = (price_change / old_price * 100) if old_price > 0 else 0
-    if abs(price_change) > 0.01:
-        ExcelManager.save_price_change(user_id, product_id, product['title'], old_price, new_price, product['currency'])
-    ExcelManager.update_product_price(user_id, product_id, new_price, product['country'])
-    message = (
-        f"✅ <b>Price Check Complete</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>{product['title'][:60]}...</b>\n\n"
-        f"💵 <b>Current Price:</b> ${new_price:.2f}\n"
-        f"📊 <b>Previous Price:</b> ${old_price:.2f}\n"
-    )
-    if abs(price_change) > 0.01:
-        if price_change < 0:
-            message += f"📉 <b>Price Drop:</b> ${abs(price_change):.2f} ({abs(change_percent):.1f}% OFF) 🎉\n"
-        else:
-            message += f"📈 <b>Price Increase:</b> ${price_change:.2f} ({change_percent:.1f}%) ⚠️\n"
-    else:
-        message += "➖ <b>No Price Change</b>\n"
-    message += f"\n🕐 <b>Checked at:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    keyboard = [
-        [InlineKeyboardButton("📊 View History", callback_data=f"history_{product_id}")],
-        [InlineKeyboardButton("🔙 Back to Product", callback_data=f"manage_{product_id}")],
-        [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
-    return MANAGING_PRODUCTS
-
-async def view_product_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View price history for a product"""
-    query = update.callback_query
-    await query.answer()
-    product_id = query.data.split("_")[1]
-    user_id = update.effective_user.id
-    products = ExcelManager.get_user_products(user_id)
-    product = next((p for p in products if p['product_id'] == product_id), None)
-    if not product:
-        await query.edit_message_text("❌ Product not found")
-        return VIEWING_HISTORY
-    history = ExcelManager.get_price_history(user_id, product_id, months=3)
-    if not history:
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"manage_{product_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await safe_edit_message(
-            query,
-            f"📊 <b>Price History</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 <b>{product['title'][:60]}...</b>\n\n"
-            f"No price changes recorded yet.\n\nPrice changes will appear here once monitoring detects them.",
-            reply_markup
-        )
-        return VIEWING_HISTORY
-    message = (
-        f"📊 <b>Price History (Last 3 months)</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>{product['title'][:60]}...</b>\n\n"
-    )
-    for idx, record in enumerate(history[:10], 1):
-        change = record['change_amount']
-        percent = record['change_percent']
-        date = record['date']
-        if change < 0:
-            icon = "📉"
-            change_text = f"${abs(change):.2f} ({abs(percent):.1f}% OFF)"
-        else:
-            icon = "📈"
-            change_text = f"${change:.2f} (+{percent:.1f}%)"
-        message += (
-            f"{icon} <b>{date}</b>\n"
-            f"   ${record['old_price']:.2f} → ${record['new_price']:.2f}\n"
-            f"   Change: {change_text}\n\n"
-        )
-    if len(history) > 10:
-        message += f"<i>... and {len(history) - 10} more changes</i>"
-    keyboard = [
-        [InlineKeyboardButton("🔄 Check Price Now", callback_data=f"check_{product_id}")],
-        [InlineKeyboardButton("🔙 Back to Product", callback_data=f"manage_{product_id}")],
-        [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, message, reply_markup)
-    return VIEWING_HISTORY
-
-async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete a product from monitoring"""
-    query = update.callback_query
-    await query.answer()
-    product_id = query.data.split("_")[1]
-    user_id = update.effective_user.id
-    products = ExcelManager.get_user_products(user_id)
-    product = next((p for p in products if p['product_id'] == product_id), None)
-    if not product:
-        await query.edit_message_text("❌ Product not found")
-        return MANAGING_PRODUCTS
-    message = (
-        f"⚠️ <b>Confirm Deletion</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 <b>{product['title'][:60]}...</b>\n\n"
-        f"Are you sure you want to stop monitoring this product?\n\n"
-        f"<i>Price history will be preserved.</i>"
-    )
-    keyboard = [
-        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{product_id}"),
-         InlineKeyboardButton("❌ Cancel", callback_data=f"manage_{product_id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, message, reply_markup)
-    return MANAGING_PRODUCTS
-
-async def confirm_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm product deletion"""
-    query = update.callback_query
-    await query.answer()
-    product_id = query.data.split("_")[2]
-    user_id = update.effective_user.id
-    success = ExcelManager.delete_product(user_id, product_id)
+    
+    products = DatabaseManager.get_user_products(user_id)
+    product_title = next((p['title'][:50] for p in products if p['product_id'] == product_id), "Product")
+    
+    success = DatabaseManager.delete_product(user_id, product_id)
+    
     if success:
-        message = "✅ <b>Product Deleted</b>\n\nThe product has been removed from monitoring."
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+            [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+        ]
+        await safe_edit_message(query, f"✅ <b>Product Deleted</b>\n\n<b>{product_title}</b>", InlineKeyboardMarkup(keyboard))
     else:
-        message = "❌ <b>Deletion Failed</b>\n\nCould not delete the product. Please try again."
-    keyboard = [
-        [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_menu")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, message, reply_markup)
-    return MANAGING_PRODUCTS
+        await safe_edit_message(query, "❌ Error deleting product.")
 
-async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help information"""
+async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    
+    message = (
+        "📊 <b>Price History</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Select time period to view price changes:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("1 Month", callback_data="history_1"),
+         InlineKeyboardButton("2 Months", callback_data="history_2"),
+         InlineKeyboardButton("3 Months", callback_data="history_3")],
+        [InlineKeyboardButton("4 Months", callback_data="history_4"),
+         InlineKeyboardButton("5 Months", callback_data="history_5"),
+         InlineKeyboardButton("6 Months", callback_data="history_6")],
+        [InlineKeyboardButton("📅 All Time", callback_data="history_all")],
+        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+        [InlineKeyboardButton("🔙 Back", callback_data="view_myproducts")]
+    ]
+    
+    if query:
+        await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    message = (
-        "ℹ️ <b>Help & Information</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>🤖 What I Do:</b>\n"
-        "• Monitor AliExpress product prices\n"
-        "• Send notifications when prices change\n"
-        "• Track price history\n"
-        "• Generate affiliate links\n\n"
-        "<b>📝 How to Use:</b>\n"
-        "1. Select your country\n"
-        "2. Send me product links\n"
-        "3. I'll monitor prices automatically\n"
-        "4. Get notified of price changes\n\n"
-        "<b>🔗 Supported Links:</b>\n"
-        "• Regular: aliexpress.com/item/...\n"
-        "• Shortened: s.click.aliexpress.com/...\n"
-        "• App links: a.aliexpress.com/...\n\n"
-        "<b>⏰ Monitoring:</b>\n"
-        "• Checks every 5 minutes\n"
-        "• Notifies you of price changes\n"
-        "• Keeps 3 months of history\n\n"
-        "<b>💡 Tips:</b>\n"
-        "• Check price manually anytime\n"
-        "• View history to track trends\n"
-        "• Delete products you're not interested in"
-    )
+    
+    user_id = update.effective_user.id
+    period = query.data.split("_")[1]
+    months = None if period == "all" else int(period)
+    
+    history_data = DatabaseManager.get_all_user_price_history(user_id, months)
+    
+    if not history_data:
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
+            [InlineKeyboardButton("🔙 Back", callback_data="view_history")]
+        ]
+        period_text = f"last {period} month(s)" if period != "all" else "all time"
+        await safe_edit_message(query, f"📊 <b>No Price Changes</b>\n\nNo changes for {period_text}.", InlineKeyboardMarkup(keyboard))
+        return
+    
+    period_text = f"Last {period} Month(s)" if period != "all" else "All Time"
+    message = f"📊 <b>Price History - {period_text}</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    total_changes = 0
+    for product_id, data in history_data.items():
+        product = data['product']
+        history = data['history']
+        total_changes += len(history)
+        
+        title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
+        message += f"📦 <b>{title}</b>\n"
+        
+        for change in history[:3]:
+            date = change['date'].strftime("%m/%d") if hasattr(change['date'], 'strftime') else str(change['date'])[:10]
+            emoji = "📉" if float(change['change_amount']) < 0 else "📈"
+            message += (
+                f"   {emoji} ${float(change['old_price']):.2f} → ${float(change['new_price']):.2f} "
+                f"({float(change['change_percent']):+.1f}%) - {date}\n"
+            )
+        
+        if len(history) > 3:
+            message += f"   <i>...and {len(history) - 3} more changes</i>\n"
+        message += "\n"
+    
+    message += f"📈 <b>Total Changes:</b> {total_changes}"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+        [InlineKeyboardButton("🔄 Change Period", callback_data="view_history")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+    ]
+    
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
+
+async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    DatabaseManager.clear_update_reminder(user_id)
+    products = DatabaseManager.get_user_products(user_id)
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_menu")]
+        [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, message, reply_markup)
-    return ENTERING_LINK
+    
+    await safe_edit_message(
+        query,
+        f"✅ <b>Monitoring Continued</b>\n\nYour <b>{len(products)}</b> product(s) will continue to be monitored.",
+        InlineKeyboardMarkup(keyboard)
+    )
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return to main menu"""
     query = update.callback_query
     await query.answer()
+    
     user_id = update.effective_user.id
-    country = ExcelManager.get_user_country(user_id) or "US"
+    country = DatabaseManager.get_user_country(user_id) or "US"
+    products = DatabaseManager.get_user_products(user_id)
     country_flags = {"FR": "🇫🇷", "IT": "🇮🇹", "US": "🇺🇸"}
+    
     message = (
-        f"🏠 <b>Main Menu</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📍 <b>Your Country:</b> {country_flags.get(country, '')} {country}\n\n"
-        f"<b>What would you like to do?</b>"
+        "🏠 <b>Main Menu</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌍 <b>Country:</b> {country_flags.get(country, '')} {country}\n"
+        f"📦 <b>Monitored Products:</b> {len(products)}\n\n"
+        "Send me an AliExpress link to add a product:"
     )
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
         [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")],
-        [InlineKeyboardButton("📊 Price History", callback_data="view_all_history")],
-        [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
+        [InlineKeyboardButton("📊 Price History", callback_data="view_history")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="show_help")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, message, reply_markup)
-    return ENTERING_LINK
+    
+    await safe_edit_message(query, message, InlineKeyboardMarkup(keyboard))
 
-async def change_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Change user's country"""
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("🇫🇷 France", callback_data="country_FR"),
-         InlineKeyboardButton("🇮🇹 Italy", callback_data="country_IT")],
-        [InlineKeyboardButton("🇺🇸 United States", callback_data="country_US")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    message = (
-        "🌍 <b>Change Country</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Select your new country:\n\n"
-        "<i>This will update all your monitored products.</i>"
+    if query:
+        await query.answer()
+    
+    help_text = (
+        "ℹ️ <b>Help - AliExpress Price Monitor</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>🔧 How it works:</b>\n"
+        "1️⃣ Select your country\n2️⃣ Send product links\n3️⃣ Get price change notifications!\n\n"
+        "<b>📋 Commands:</b>\n/start - Start\n/help - Help\n/myproducts - Products\n/history - History\n\n"
+        f"<b>⚡ Fast Monitoring:</b>\n• {CONCURRENT_REQUESTS} concurrent requests\n"
+        f"• Updates every {MONITORING_INTERVAL//60} minutes"
     )
-    await safe_edit_message(query, message, reply_markup)
-    return CHANGING_COUNTRY
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the conversation"""
-    await update.message.reply_text("Operation cancelled. Use /start to begin again.")
-    return ConversationHandler.END
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+    ]
+    
+    if query:
+        await safe_edit_message(query, help_text, InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 # ============================================================================
-# PRICE MONITORING BACKGROUND TASK
+# PRICE MONITORING
 # ============================================================================
-async def monitor_prices(application):
-    """Background task to monitor product prices"""
-    print("🔍 Price monitoring started")
-    while True:
+async def check_single_product(api: AliExpressAPI, product: Dict, context: ContextTypes.DEFAULT_TYPE) -> Dict:
+    start_time = time.time()
+    
+    try:
+        user_country = DatabaseManager.get_user_country(product['user_id']) or product['country']
+        result = await api.get_product_details(product['product_id'], user_country)
+        api_time = result.get('time_taken', 0)
+        
+        if not result.get("success"):
+            DatabaseManager.update_product_price(product['user_id'], product['product_id'], float(product['current_price']), user_country)
+            print(f"   ❌ {product['product_id']}: {result.get('error')} (⏱️ {api_time:.2f}s)")
+            return {'success': False, 'product_id': product['product_id'], 'error': result.get('error'), 'time_taken': time.time() - start_time}
+        
+        new_price = result['price']
+        old_price = float(product['current_price'])
+        
+        DatabaseManager.update_product_price(product['user_id'], product['product_id'], new_price, user_country, result['product_url'])
+        
+        price_changed = abs(new_price - old_price) > 0.01
+        
+        if price_changed:
+            DatabaseManager.save_price_change(product['user_id'], product['product_id'], product['title'], old_price, new_price, product['currency'])
+            
+            change = new_price - old_price
+            change_percent = (change / old_price * 100) if old_price > 0 else 0
+            print(f"   💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%)")
+            
+            emoji = "📉 PRICE DROP!" if change < 0 else "📈 PRICE INCREASE"
+            affiliate_link = await api.generate_affiliate_link(result['product_url'], user_country)
+            
+            notification = (
+                f"{emoji}\n\n<b>{product['title'][:80]}...</b>\n\n"
+                f"💵 <b>Old:</b> ${old_price:.2f}\n💵 <b>New:</b> ${new_price:.2f}\n"
+                f"📊 <b>Change:</b> ${change:+.2f} ({change_percent:+.1f}%)\n"
+            )
+            if change < 0:
+                notification += f"💰 <b>You Save:</b> ${abs(change):.2f}\n"
+            notification += f"\n🔗 <code>{affiliate_link}</code>"
+            
+            keyboard = [
+                [InlineKeyboardButton("🛒 Buy Now", url=affiliate_link)],
+                [InlineKeyboardButton("📊 View History", callback_data="view_history")]
+            ]
+            
+            try:
+                if product.get('image_url'):
+                    await context.bot.send_photo(chat_id=product['user_id'], photo=product['image_url'],
+                                                 caption=notification, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+                else:
+                    await context.bot.send_message(chat_id=product['user_id'], text=notification,
+                                                   reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            except Exception as e:
+                print(f"      ❌ Notification failed: {e}")
+        else:
+            print(f"   ✅ {product['product_id']}: ${new_price:.2f} (no change)")
+        
+        return {'success': True, 'product_id': product['product_id'], 'old_price': old_price, 'new_price': new_price,
+                'changed': price_changed, 'time_taken': time.time() - start_time}
+    
+    except Exception as e:
+        print(f"   ❌ {product['product_id']}: Exception - {str(e)}")
+        return {'success': False, 'product_id': product['product_id'], 'error': str(e), 'time_taken': time.time() - start_time}
+
+async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
+    print(f"\n{'='*70}\n🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*70}")
+    
+    cycle_start = time.time()
+    products_to_check = DatabaseManager.get_products_to_check(PRODUCTS_PER_CYCLE)
+    
+    if not products_to_check:
+        print("⚠️ No products to check")
+        return
+    
+    print(f"📦 Checking {len(products_to_check)} products...")
+    api = await get_api_instance()
+    
+    price_changes, checked, errors = 0, 0, 0
+    
+    for i in range(0, len(products_to_check), CONCURRENT_REQUESTS):
+        batch = products_to_check[i:i + CONCURRENT_REQUESTS]
+        print(f"\n📦 Batch {i//CONCURRENT_REQUESTS + 1}: Checking {len(batch)} products...")
+        
+        tasks = [check_single_product(api, product, context) for product in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, Exception):
+                errors += 1
+            elif result.get('success'):
+                checked += 1
+                if result.get('changed'):
+                    price_changes += 1
+            else:
+                errors += 1
+        
+        if i + CONCURRENT_REQUESTS < len(products_to_check):
+            await asyncio.sleep(REQUEST_DELAY)
+    
+    cycle_time = time.time() - cycle_start
+    print(f"\n{'─'*70}\n✅ CYCLE COMPLETE: {checked}/{len(products_to_check)} checked, {price_changes} changes, {errors} errors ({cycle_time:.2f}s)\n{'='*70}\n")
+
+async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
+    print(f"\n🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    users_need_reminder = DatabaseManager.get_users_needing_reminder()
+    for user_id in users_need_reminder:
+        products = DatabaseManager.get_user_products(user_id)
+        if products:
+            DatabaseManager.set_update_reminder(user_id)
+            try:
+                keyboard = [
+                    [InlineKeyboardButton("✅ Continue Monitoring", callback_data="update_continue")],
+                    [InlineKeyboardButton("➕ Add Products", callback_data="add_product")],
+                    [InlineKeyboardButton("🗑️ Manage Products", callback_data="manage_products")]
+                ]
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔔 <b>Monthly Product List Update</b>\n\nYou are monitoring <b>{len(products)}</b> product(s).\n\nWould you like to continue?",
+                    reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
+                )
+            except Exception as e:
+                print(f"   ❌ Reminder failed for {user_id}: {e}")
+            await asyncio.sleep(2)
+    
+    users_past_deadline = DatabaseManager.get_users_past_deadline()
+    for user_id in users_past_deadline:
         try:
-            await asyncio.sleep(MONITORING_INTERVAL)
-            products = ExcelManager.get_products_to_check(PRODUCTS_PER_CYCLE)
-            if not products:
-                print("   No products to check")
-                continue
-            print(f"   Checking {len(products)} products...")
-            api = await get_api_instance()
-            for i in range(0, len(products), CONCURRENT_REQUESTS):
-                batch = products[i:i + CONCURRENT_REQUESTS]
-                tasks = []
-                for product in batch:
-                    task = api.get_product_details(product['product_id'], product['country'])
-                    tasks.append((product, task))
-                results = await asyncio.gather(*[task for _, task in tasks])
-                for (product, _), result in zip(tasks, results):
-                    if result.get('success'):
-                        new_price = result['price']
-                        old_price = product['current_price']
-                        price_change = new_price - old_price
-                        if abs(price_change) > 0.01:
-                            ExcelManager.save_price_change(
-                                product['user_id'], product['product_id'], product['title'],
-                                old_price, new_price, product['currency']
-                            )
-                            try:
-                                change_percent = (price_change / old_price * 100) if old_price > 0 else 0
-                                if price_change < 0:
-                                    emoji = "📉"
-                                    message = (
-                                        f"{emoji} <b>Price Drop Alert!</b>\n\n"
-                                        f"📦 <b>{product['title'][:60]}...</b>\n\n"
-                                        f"💵 New Price: ${new_price:.2f}\n"
-                                        f"📊 Old Price: ${old_price:.2f}\n"
-                                        f"🎉 Saved: ${abs(price_change):.2f} ({abs(change_percent):.1f}% OFF)\n\n"
-                                        f"🔗 <code>{product['product_url']}</code>"
-                                    )
-                                else:
-                                    emoji = "📈"
-                                    message = (
-                                        f"{emoji} <b>Price Increase Alert</b>\n\n"
-                                        f"📦 <b>{product['title'][:60]}...</b>\n\n"
-                                        f"💵 New Price: ${new_price:.2f}\n"
-                                        f"📊 Old Price: ${old_price:.2f}\n"
-                                        f"⚠️ Increase: ${price_change:.2f} (+{change_percent:.1f}%)\n\n"
-                                        f"🔗 <code>{product['product_url']}</code>"
-                                    )
-                                keyboard = [
-                                    [InlineKeyboardButton("📦 View Product", callback_data=f"manage_{product['product_id']}")],
-                                    [InlineKeyboardButton("📋 My Products", callback_data="view_myproducts")]
-                                ]
-                                reply_markup = InlineKeyboardMarkup(keyboard)
-                                await application.bot.send_message(
-                                    chat_id=product['user_id'],
-                                    text=message,
-                                    reply_markup=reply_markup,
-                                    parse_mode='HTML'
-                                )
-                            except Exception as e:
-                                print(f"   ❌ Failed to send notification: {e}")
-                        ExcelManager.update_product_price(
-                            product['user_id'], product['product_id'], new_price, product['country']
-                        )
-                await asyncio.sleep(REQUEST_DELAY)
-        except Exception as e:
-            print(f"❌ Error in price monitoring: {e}")
-
-# ============================================================================
-# FLASK WEB SERVER
-# ============================================================================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "✅ Telegram Bot is running!"
-
-@app.route('/health')
-def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-def run_flask():
-    """Run Flask server"""
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+            await context.bot.send_message(chat_id=user_id, text="⚠️ <b>Products Removed</b>\n\nUse /start to begin again.", parse_mode='HTML')
+        except: pass
+        DatabaseManager.delete_all_user_data(user_id)
+        DatabaseManager.clear_update_reminder(user_id)
 
 # ============================================================================
 # MAIN FUNCTION
 # ============================================================================
-async def main():
-    """Main function to run the bot"""
-    print("🚀 Starting Telegram Bot...")
-    ExcelManager.init_excel_files()
+def run_flask():
+    """Run Flask server for health checks"""
+    flask_app.run(host='0.0.0.0', port=PORT, threaded=True)
+
+def main():
+    print(f"\n{'='*70}")
+    print("🤖 ALIEXPRESS PRICE MONITOR BOT - KOYEB EDITION")
+    print(f"{'='*70}")
+    print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔌 Port: {PORT}")
+    print(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
+    print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
+    print(f"{'='*70}\n")
+    
+    # Initialize database
+    DatabaseManager.init_database()
+    
+    # Start Flask in background thread for health checks
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"✅ Health check server started on port {PORT}")
+    
+    # Build Telegram application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Conversation handler
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[CommandHandler("start", start)],
         states={
             SELECTING_COUNTRY: [CallbackQueryHandler(country_selected, pattern="^country_")],
             ENTERING_LINK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
                 CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
                 CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                CallbackQueryHandler(show_help, pattern="^show_help$"),
+                CallbackQueryHandler(view_price_history, pattern="^view_history$"),
                 CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                CallbackQueryHandler(change_country, pattern="^change_country$")
-            ],
-            CHANGING_COUNTRY: [CallbackQueryHandler(country_selected, pattern="^country_")],
-            MANAGING_PRODUCTS: [
-                CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                CallbackQueryHandler(manage_product, pattern="^manage_"),
-                CallbackQueryHandler(check_price_now, pattern="^check_"),
-                CallbackQueryHandler(view_product_history, pattern="^history_"),
-                CallbackQueryHandler(delete_product, pattern="^delete_"),
-                CallbackQueryHandler(confirm_delete_product, pattern="^confirm_delete_"),
-                CallbackQueryHandler(add_product_prompt, pattern="^add_product$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")
-            ],
-            VIEWING_HISTORY: [
-                CallbackQueryHandler(view_product_history, pattern="^history_"),
-                CallbackQueryHandler(manage_product, pattern="^manage_"),
-                CallbackQueryHandler(check_price_now, pattern="^check_"),
-                CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$")
+                CallbackQueryHandler(help_command, pattern="^show_help$")
             ]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler("start", start)],
+        allow_reentry=True
     )
     
     application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
+    application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
+    application.add_handler(CallbackQueryHandler(manage_products, pattern="^manage_products$"))
+    application.add_handler(CallbackQueryHandler(delete_product_callback, pattern="^delete_"))
+    application.add_handler(CallbackQueryHandler(view_price_history, pattern="^view_history$"))
+    application.add_handler(CallbackQueryHandler(show_price_history, pattern="^history_"))
+    application.add_handler(CallbackQueryHandler(handle_update_continue, pattern="^update_continue$"))
+    application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
+    application.add_handler(CallbackQueryHandler(help_command, pattern="^show_help$"))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myproducts", view_my_products))
+    application.add_handler(CommandHandler("history", view_price_history))
     
-    # Start Flask server
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print(f"✅ Flask server started on port {os.environ.get('PORT', 8000)}")
+    # Job queue for monitoring
+    job_queue = application.job_queue
+    job_queue.run_repeating(monitor_prices, interval=MONITORING_INTERVAL, first=10)
+    job_queue.run_repeating(check_monthly_updates, interval=MONTHLY_CHECK_INTERVAL, first=60)
     
-    # Initialize and start bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    print("✅ Bot is running!")
-    
-    # Start price monitoring
-    asyncio.create_task(monitor_prices(application))
-    
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        print("\n⚠️ Stopping bot...")
-        await application.stop()
+    print("✅ BOT STARTED SUCCESSFULLY!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⛔ Bot stopped")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
