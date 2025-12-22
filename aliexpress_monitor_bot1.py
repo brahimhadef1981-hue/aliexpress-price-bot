@@ -56,7 +56,7 @@ MONTHLY_CHECK_INTERVAL = 86400
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
 
 # ============================================================================
-# EXCEL MANAGEMENT - SAME AS BEFORE
+# EXCEL MANAGEMENT
 # ============================================================================
 class ExcelManager:
     @staticmethod
@@ -775,7 +775,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
             pass
 
 # ============================================================================
-# TELEGRAM BOT HANDLERS - UPDATED WITH ASYNC API
+# TELEGRAM BOT HANDLERS
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1036,7 +1036,7 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not products:
         keyboard = [
             [InlineKeyboardButton("➕ Add Product", callback_data="add_product")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1527,7 +1527,8 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     print(f"   • Errors: {errors}")
     print(f"   • Average time per product: {avg_time:.2f}s")
     print(f"   • Total cycle time: {cycle_time:.2f}s")
-    print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
+    if checked > 0:
+        print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
     print(f"{'='*70}\n")
 
 async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1614,7 +1615,7 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
         print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
 
 # ============================================================================
-# MAIN FUNCTION
+# MAIN FUNCTION - FIXED VERSION
 # ============================================================================
 
 def main():
@@ -1631,8 +1632,13 @@ def main():
 
     ExcelManager.init_excel_files()
 
+    # Build the application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Get job queue AFTER application is built
+    job_queue = application.job_queue
 
+    # Set up conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -1652,6 +1658,7 @@ def main():
         allow_reentry=True,
     )
 
+    # Add all handlers
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
     application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
@@ -1667,8 +1674,7 @@ def main():
     application.add_handler(CommandHandler("myproducts", view_my_products))
     application.add_handler(CommandHandler("history", view_price_history))
 
-    job_queue = application.job_queue
-    
+    # Set up job queue AFTER all handlers are added
     job_queue.run_repeating(
         monitor_prices,
         interval=MONITORING_INTERVAL,
@@ -1684,6 +1690,7 @@ def main():
     print("✅ BOT STARTED SUCCESSFULLY!")
     print(f"⌨️  Press Ctrl+C to stop.\n")
 
+    # Start polling
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
@@ -1691,10 +1698,25 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         print("\n⛔ Bot stopped by user")
-        # Cleanup
+        # Cleanup API session
         if api_instance:
-            asyncio.run(api_instance.close_session())
+            # Create new event loop for cleanup
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(api_instance.close_session())
+            finally:
+                loop.close()
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Cleanup API session
         if api_instance:
-            asyncio.run(api_instance.close_session())
+            # Create new event loop for cleanup
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(api_instance.close_session())
+            finally:
+                loop.close()
