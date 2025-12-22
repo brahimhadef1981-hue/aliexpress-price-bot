@@ -1,10 +1,21 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AliExpress Price Monitor Bot - Ubuntu Compatible Version
+"""
+
 import os
 import re
+import sys
 import time
 import asyncio
 import hashlib
 import hmac
+import signal
+import logging
 import aiohttp
+import ssl
+import certifi
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -23,6 +34,23 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # ============================================================================
+# LOGGING CONFIGURATION FOR UBUNTU
+# ============================================================================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Reduce noise from httpx and httpcore
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+# ============================================================================
 # CONFIGURATION - CHANGE THESE WITH YOUR CREDENTIALS!
 # ============================================================================
 TELEGRAM_BOT_TOKEN = "8354835888:AAF_F1KR40K6nmI_RwkDPwUa74L__CNuY3s"
@@ -30,10 +58,13 @@ ALIEXPRESS_APP_KEY = "519492"
 ALIEXPRESS_APP_SECRET = "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk"
 ALIEXPRESS_TRACKING_ID = "hadef"
 
-# Excel files
-USERS_FILE = "users.xlsx"
-PRODUCTS_FILE = "products.xlsx"
-PRICE_HISTORY_FILE = "price_history.xlsx"
+# Get the directory where the script is located (for Ubuntu compatibility)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Excel files - use absolute paths for Ubuntu
+USERS_FILE = os.path.join(SCRIPT_DIR, "users.xlsx")
+PRODUCTS_FILE = os.path.join(SCRIPT_DIR, "products.xlsx")
+PRICE_HISTORY_FILE = os.path.join(SCRIPT_DIR, "price_history.xlsx")
 
 # Monitoring configuration - OPTIMIZED FOR SPEED
 CONCURRENT_REQUESTS = 10  # Process 10 products at the same time
@@ -55,39 +86,101 @@ MONTHLY_CHECK_INTERVAL = 86400
 # States for conversation
 SELECTING_COUNTRY, ENTERING_LINK, CHANGING_COUNTRY, MANAGING_PRODUCTS, VIEWING_HISTORY = range(5)
 
+# Global variables for cleanup
+api_instance = None
+shutdown_event = asyncio.Event() if sys.version_info >= (3, 10) else None
+
 # ============================================================================
-# EXCEL MANAGEMENT - SAME AS BEFORE
+# UBUNTU-SPECIFIC HELPER FUNCTIONS
+# ============================================================================
+
+def setup_ubuntu_environment():
+    """Setup environment for Ubuntu"""
+    # Ensure UTF-8 encoding
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except AttributeError:
+            pass
+    
+    # Set locale
+    try:
+        import locale
+        locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+    except:
+        try:
+            locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+        except:
+            pass
+    
+    # Create directory if it doesn't exist
+    os.makedirs(SCRIPT_DIR, exist_ok=True)
+    
+    logger.info(f"Script directory: {SCRIPT_DIR}")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {sys.platform}")
+
+def get_ssl_context():
+    """Get SSL context for aiohttp on Ubuntu"""
+    try:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        return ssl_context
+    except Exception as e:
+        logger.warning(f"Could not create SSL context with certifi: {e}")
+        # Fallback to default SSL context
+        return ssl.create_default_context()
+
+# ============================================================================
+# EXCEL MANAGEMENT - UBUNTU COMPATIBLE
 # ============================================================================
 class ExcelManager:
+    _file_lock = asyncio.Lock() if sys.version_info >= (3, 10) else None
+    
+    @staticmethod
+    def _get_lock():
+        """Get or create file lock for thread safety"""
+        if ExcelManager._file_lock is None:
+            ExcelManager._file_lock = asyncio.Lock()
+        return ExcelManager._file_lock
+    
     @staticmethod
     def init_excel_files():
         """Initialize Excel files if they don't exist"""
-        if not os.path.exists(USERS_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Users"
-            ws.append(["User ID", "Username", "Country", "Date Added", "Last Update Reminder", 
-                      "Update Deadline", "Needs Update Response"])
-            wb.save(USERS_FILE)
-            print(f"✅ Created {USERS_FILE}")
+        try:
+            if not os.path.exists(USERS_FILE):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Users"
+                ws.append(["User ID", "Username", "Country", "Date Added", "Last Update Reminder", 
+                          "Update Deadline", "Needs Update Response"])
+                wb.save(USERS_FILE)
+                logger.info(f"✅ Created {USERS_FILE}")
 
-        if not os.path.exists(PRODUCTS_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Products"
-            ws.append(["User ID", "Product ID", "Product URL", "Title", "Current Price", 
-                      "Original Price", "Currency", "Image URL", "Country", "Date Added", "Last Checked"])
-            wb.save(PRODUCTS_FILE)
-            print(f"✅ Created {PRODUCTS_FILE}")
-        
-        if not os.path.exists(PRICE_HISTORY_FILE):
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Price History"
-            ws.append(["User ID", "Product ID", "Product Title", "Old Price", "New Price", 
-                      "Change Amount", "Change Percent", "Currency", "Date"])
-            wb.save(PRICE_HISTORY_FILE)
-            print(f"✅ Created {PRICE_HISTORY_FILE}")
+            if not os.path.exists(PRODUCTS_FILE):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Products"
+                ws.append(["User ID", "Product ID", "Product URL", "Title", "Current Price", 
+                          "Original Price", "Currency", "Image URL", "Country", "Date Added", "Last Checked"])
+                wb.save(PRODUCTS_FILE)
+                logger.info(f"✅ Created {PRODUCTS_FILE}")
+            
+            if not os.path.exists(PRICE_HISTORY_FILE):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Price History"
+                ws.append(["User ID", "Product ID", "Product Title", "Old Price", "New Price", 
+                          "Change Amount", "Change Percent", "Currency", "Date"])
+                wb.save(PRICE_HISTORY_FILE)
+                logger.info(f"✅ Created {PRICE_HISTORY_FILE}")
+                
+        except PermissionError as e:
+            logger.error(f"❌ Permission denied creating files: {e}")
+            logger.error("Try running: sudo chmod 755 on the script directory")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error creating Excel files: {e}")
+            raise
 
     @staticmethod
     def save_user(user_id: int, username: str, country: str):
@@ -109,7 +202,7 @@ class ExcelManager:
             
             wb.save(USERS_FILE)
         except Exception as e:
-            print(f"❌ Error saving user: {e}")
+            logger.error(f"❌ Error saving user: {e}")
 
     @staticmethod
     def get_user_country(user_id: int) -> Optional[str]:
@@ -122,7 +215,7 @@ class ExcelManager:
                 if row[0].value == user_id:
                     return row[2].value
         except Exception as e:
-            print(f"❌ Error getting user country: {e}")
+            logger.error(f"❌ Error getting user country: {e}")
         return None
 
     @staticmethod
@@ -141,7 +234,7 @@ class ExcelManager:
             wb.save(PRODUCTS_FILE)
             return updated_count
         except Exception as e:
-            print(f"❌ Error updating products country: {e}")
+            logger.error(f"❌ Error updating products country: {e}")
             return 0
 
     @staticmethod
@@ -170,7 +263,7 @@ class ExcelManager:
             
             wb.save(PRODUCTS_FILE)
         except Exception as e:
-            print(f"❌ Error saving product: {e}")
+            logger.error(f"❌ Error saving product: {e}")
 
     @staticmethod
     def get_all_products() -> List[Dict]:
@@ -196,7 +289,7 @@ class ExcelManager:
                         'last_checked': row[10]
                     })
         except Exception as e:
-            print(f"❌ Error getting products: {e}")
+            logger.error(f"❌ Error getting products: {e}")
         
         return products
 
@@ -239,7 +332,7 @@ class ExcelManager:
             
             wb.save(PRODUCTS_FILE)
         except Exception as e:
-            print(f"❌ Error updating product price: {e}")
+            logger.error(f"❌ Error updating product price: {e}")
 
     @staticmethod
     def save_price_change(user_id: int, product_id: str, title: str, old_price: float, 
@@ -268,9 +361,9 @@ class ExcelManager:
             ])
             
             wb.save(PRICE_HISTORY_FILE)
-            print(f"✅ Price change archived: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
+            logger.info(f"✅ Price change archived: {title} - ${change:+.2f} ({change_percent:+.1f}%)")
         except Exception as e:
-            print(f"❌ Error saving price change: {e}")
+            logger.error(f"❌ Error saving price change: {e}")
 
     @staticmethod
     def get_user_products(user_id: int) -> List[Dict]:
@@ -296,7 +389,7 @@ class ExcelManager:
             wb.save(PRODUCTS_FILE)
             return True
         except Exception as e:
-            print(f"❌ Error deleting product: {e}")
+            logger.error(f"❌ Error deleting product: {e}")
             return False
 
     @staticmethod
@@ -328,7 +421,7 @@ class ExcelManager:
                         'date': row[8]
                     })
         except Exception as e:
-            print(f"❌ Error getting price history: {e}")
+            logger.error(f"❌ Error getting price history: {e}")
         
         return sorted(history, key=lambda x: x['date'], reverse=True)
 
@@ -367,7 +460,7 @@ class ExcelManager:
             
             wb.save(USERS_FILE)
         except Exception as e:
-            print(f"❌ Error setting update reminder: {e}")
+            logger.error(f"❌ Error setting update reminder: {e}")
 
     @staticmethod
     def clear_update_reminder(user_id: int):
@@ -385,7 +478,7 @@ class ExcelManager:
             
             wb.save(USERS_FILE)
         except Exception as e:
-            print(f"❌ Error clearing update reminder: {e}")
+            logger.error(f"❌ Error clearing update reminder: {e}")
 
     @staticmethod
     def get_users_needing_reminder() -> List[int]:
@@ -417,7 +510,7 @@ class ExcelManager:
                         users.append(user_id)
         
         except Exception as e:
-            print(f"❌ Error getting users needing reminder: {e}")
+            logger.error(f"❌ Error getting users needing reminder: {e}")
         
         return users
 
@@ -449,7 +542,7 @@ class ExcelManager:
                         pass
         
         except Exception as e:
-            print(f"❌ Error getting users past deadline: {e}")
+            logger.error(f"❌ Error getting users past deadline: {e}")
         
         return users
 
@@ -483,15 +576,16 @@ class ExcelManager:
             
             wb.save(PRICE_HISTORY_FILE)
             
-            print(f"✅ Deleted all data for user {user_id}")
+            logger.info(f"✅ Deleted all data for user {user_id}")
             return True
             
         except Exception as e:
-            print(f"❌ Error deleting user data: {e}")
+            logger.error(f"❌ Error deleting user data: {e}")
             return False
 
+
 # ============================================================================
-# ASYNC ALIEXPRESS API CLIENT - OPTIMIZED FOR SPEED
+# ASYNC ALIEXPRESS API CLIENT - UBUNTU COMPATIBLE
 # ============================================================================
 class AliExpressAPI:
     def __init__(self, app_key: str, app_secret: str, tracking_id: str):
@@ -501,25 +595,38 @@ class AliExpressAPI:
         self.api_url = "https://api-sg.aliexpress.com/sync"
         self.timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         self.session = None
+        self._session_lock = asyncio.Lock()
 
     async def get_session(self):
-        """Get or create aiohttp session with connection pooling"""
-        if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=50,  # Max concurrent connections
-                limit_per_host=10,
-                ttl_dns_cache=300
-            )
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=self.timeout
-            )
-        return self.session
+        """Get or create aiohttp session with connection pooling - Ubuntu compatible"""
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                ssl_context = get_ssl_context()
+                connector = aiohttp.TCPConnector(
+                    limit=50,  # Max concurrent connections
+                    limit_per_host=10,
+                    ttl_dns_cache=300,
+                    ssl=ssl_context,
+                    force_close=False,
+                    enable_cleanup_closed=True
+                )
+                self.session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=self.timeout,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+                )
+            return self.session
 
     async def close_session(self):
-        """Close aiohttp session"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        """Close aiohttp session safely"""
+        async with self._session_lock:
+            if self.session and not self.session.closed:
+                await self.session.close()
+                # Wait a bit for connections to close properly on Linux
+                await asyncio.sleep(0.25)
+                self.session = None
 
     @staticmethod
     def _now_ms() -> str:
@@ -564,22 +671,33 @@ class AliExpressAPI:
         return f"https://www.aliexpress.com/item/{product_id}.html"
 
     async def resolve_shortened_url(self, url: str, max_retries: int = 3) -> str:
-        """Async URL resolver"""
+        """Async URL resolver - Ubuntu compatible"""
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         }
         
         session = await self.get_session()
         
         for attempt in range(max_retries):
             try:
-                async with session.head(url, allow_redirects=True, headers=headers) as response:
+                async with session.head(url, allow_redirects=True, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     final_url = str(response.url)
                     
                     if self.extract_product_id(final_url):
                         return final_url
                 
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+            except aiohttp.ClientError as e:
+                logger.warning(f"URL resolution error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
             except Exception as e:
+                logger.warning(f"Unexpected error resolving URL: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
@@ -607,8 +725,8 @@ class AliExpressAPI:
         return any(pattern in error_msg.lower() for pattern in rate_limit_patterns)
 
     async def get_product_details(self, product_id: str, country: str = "US", retry_count: int = 0) -> Dict[str, Any]:
-        """Async product details fetcher - OPTIMIZED WITH TIMING"""
-        start_time = time.time()  # Start timing
+        """Async product details fetcher - Ubuntu compatible with timing"""
+        start_time = time.time()
         
         method = "aliexpress.affiliate.productdetail.get"
         
@@ -635,7 +753,7 @@ class AliExpressAPI:
                 response.raise_for_status()
                 data = await response.json()
                 
-                elapsed_time = time.time() - start_time  # Calculate elapsed time
+                elapsed_time = time.time() - start_time
                 
                 if "error_response" in data:
                     error_msg = data["error_response"].get("msg", "API Error")
@@ -700,8 +818,12 @@ class AliExpressAPI:
         except asyncio.TimeoutError:
             elapsed_time = time.time() - start_time
             return {"success": False, "error": "Request timeout", "time_taken": elapsed_time}
+        except aiohttp.ClientError as e:
+            elapsed_time = time.time() - start_time
+            return {"success": False, "error": f"Network error: {str(e)}", "time_taken": elapsed_time}
         except Exception as e:
             elapsed_time = time.time() - start_time
+            logger.error(f"Unexpected error in get_product_details: {e}")
             return {"success": False, "error": str(e), "time_taken": elapsed_time}
 
     async def generate_affiliate_link(self, product_url: str, country: str = "US") -> Optional[str]:
@@ -742,10 +864,9 @@ class AliExpressAPI:
                 return product_url
                 
         except Exception as e:
+            logger.warning(f"Error generating affiliate link: {e}")
             return product_url
 
-# Global API instance
-api_instance = None
 
 async def get_api_instance():
     """Get or create global API instance"""
@@ -753,6 +874,7 @@ async def get_api_instance():
     if api_instance is None:
         api_instance = AliExpressAPI(ALIEXPRESS_APP_KEY, ALIEXPRESS_APP_SECRET, ALIEXPRESS_TRACKING_ID)
     return api_instance
+
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -766,16 +888,20 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode='HTML'):
             await query.message.delete()
         except:
             pass
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        try:
+            await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.error(f"Failed to send replacement message: {e2}")
     except Exception as e:
-        print(f"Error editing message: {e}")
+        logger.error(f"Error editing message: {e}")
         try:
             await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except:
             pass
 
+
 # ============================================================================
-# TELEGRAM BOT HANDLERS - UPDATED WITH ASYNC API
+# TELEGRAM BOT HANDLERS
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -805,6 +931,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='HTML')
     return SELECTING_COUNTRY
+
 
 async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle country selection"""
@@ -849,6 +976,7 @@ async def country_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(query, message, reply_markup)
     return ENTERING_LINK
 
+
 async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show prompt to add a product"""
     query = update.callback_query
@@ -871,12 +999,13 @@ async def add_product_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await safe_edit_message(query, message, reply_markup)
     return ENTERING_LINK
 
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle product link submission - ASYNC VERSION WITH TIMING"""
     if not update.message or not update.message.text:
         return ENTERING_LINK
     
-    total_start_time = time.time()  # Start total timing
+    total_start_time = time.time()
     
     user_id = update.effective_user.id
     product_url = update.message.text.strip()
@@ -1014,15 +1143,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML'
             )
             await processing_msg.delete()
-        except:
+        except Exception as e:
+            logger.warning(f"Could not send photo: {e}")
             await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
     else:
         await processing_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
     # Print timing info to console
-    print(f"   ⏱️ Product {product_id} added - API: {api_time:.2f}s, Total: {total_time:.2f}s")
+    logger.info(f"Product {product_id} added - API: {api_time:.2f}s, Total: {total_time:.2f}s")
 
     return ENTERING_LINK
+
 
 async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's products"""
@@ -1078,6 +1209,7 @@ async def view_my_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
+
 async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show products with delete buttons"""
     query = update.callback_query
@@ -1104,6 +1236,7 @@ async def manage_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await safe_edit_message(query, message, reply_markup)
+
 
 async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle product deletion"""
@@ -1140,6 +1273,7 @@ async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_
     else:
         await safe_edit_message(query, "❌ Error deleting product. Please try again.")
 
+
 async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show price history selection"""
     query = update.callback_query
@@ -1174,6 +1308,7 @@ async def view_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_edit_message(query, message, reply_markup)
     else:
         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+
 
 async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display price history"""
@@ -1238,6 +1373,7 @@ async def show_price_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await safe_edit_message(query, message, reply_markup)
 
+
 async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User chose to continue monitoring"""
     query = update.callback_query
@@ -1263,6 +1399,7 @@ async def handle_update_continue(update: Update, context: ContextTypes.DEFAULT_T
         f"You'll receive another reminder in {MONTHLY_UPDATE_REMINDER_DAYS} days.",
         reply_markup
     )
+
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return to main menu"""
@@ -1293,6 +1430,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await safe_edit_message(query, message, reply_markup)
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message"""
@@ -1333,8 +1471,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(help_text, reply_markup=reply_markup, parse_mode='HTML')
 
+
 # ============================================================================
-# OPTIMIZED CONCURRENT PRICE MONITORING WITH TIMING
+# OPTIMIZED CONCURRENT PRICE MONITORING
 # ============================================================================
 
 async def check_single_product(api: AliExpressAPI, product: Dict, context: ContextTypes.DEFAULT_TYPE) -> Dict:
@@ -1346,7 +1485,6 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
         
         result = await api.get_product_details(product['product_id'], user_country)
         
-        # Get the API time from the result
         api_time = result.get('time_taken', 0)
         
         if not result.get("success"):
@@ -1358,7 +1496,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             )
             
             total_time = time.time() - start_time
-            print(f"   ❌ {product['product_id']}: {result.get('error')} (⏱️ {api_time:.2f}s)")
+            logger.debug(f"❌ {product['product_id']}: {result.get('error')} (⏱️ {api_time:.2f}s)")
             
             return {
                 'success': False,
@@ -1395,7 +1533,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             change = new_price - old_price
             change_percent = (change / old_price * 100) if old_price > 0 else 0
             
-            print(f"   💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%) (⏱️ {api_time:.2f}s)")
+            logger.info(f"💰 {product['product_id']}: ${old_price:.2f} → ${new_price:.2f} ({change_percent:+.1f}%)")
             
             emoji = "📉 PRICE DROP!" if change < 0 else "📈 PRICE INCREASE"
             
@@ -1437,9 +1575,9 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
                         parse_mode='HTML'
                     )
             except Exception as e:
-                print(f"      ❌ Notification failed: {e}")
+                logger.error(f"Notification failed for user {product['user_id']}: {e}")
         else:
-            print(f"   ✅ {product['product_id']}: ${new_price:.2f} (no change) (⏱️ {api_time:.2f}s)")
+            logger.debug(f"✅ {product['product_id']}: ${new_price:.2f} (no change)")
         
         return {
             'success': True,
@@ -1452,7 +1590,7 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
         
     except Exception as e:
         total_time = time.time() - start_time
-        print(f"   ❌ {product['product_id']}: Exception - {str(e)} (⏱️ {total_time:.2f}s)")
+        logger.error(f"❌ {product['product_id']}: Exception - {str(e)}")
         return {
             'success': False,
             'product_id': product['product_id'],
@@ -1460,26 +1598,25 @@ async def check_single_product(api: AliExpressAPI, product: Dict, context: Conte
             'time_taken': total_time
         }
 
+
 async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Monitor products with CONCURRENT processing - MUCH FASTER WITH TIMING!"""
-    print(f"\n{'='*70}")
-    print(f"🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*70}")
+    """Monitor products with CONCURRENT processing"""
+    logger.info(f"{'='*70}")
+    logger.info(f"🔍 MONITORING CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"{'='*70}")
     
     cycle_start = time.time()
 
     products_to_check = ExcelManager.get_products_to_check(PRODUCTS_PER_CYCLE)
     
     if not products_to_check:
-        print("⚠️ No products to check")
+        logger.info("⚠️ No products to check")
         return
 
-    print(f"📦 Checking {len(products_to_check)} products with {CONCURRENT_REQUESTS} concurrent requests...")
-    print(f"{'─'*70}")
+    logger.info(f"📦 Checking {len(products_to_check)} products with {CONCURRENT_REQUESTS} concurrent requests...")
     
     api = await get_api_instance()
     
-    # Process products in batches concurrently
     price_changes = 0
     checked = 0
     errors = 0
@@ -1489,7 +1626,7 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
         batch = products_to_check[i:i + CONCURRENT_REQUESTS]
         batch_start = time.time()
         
-        print(f"\n📦 Batch {i//CONCURRENT_REQUESTS + 1}: Checking {len(batch)} products...")
+        logger.info(f"📦 Batch {i//CONCURRENT_REQUESTS + 1}: Checking {len(batch)} products...")
         
         # Check multiple products simultaneously
         tasks = [check_single_product(api, product, context) for product in batch]
@@ -1501,6 +1638,7 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
         for result in results:
             if isinstance(result, Exception):
                 errors += 1
+                logger.error(f"Task exception: {result}")
                 continue
                 
             if result.get('success'):
@@ -1511,7 +1649,7 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
             else:
                 errors += 1
         
-        print(f"   ⏱️ Batch completed in {batch_time:.2f}s")
+        logger.info(f"   ⏱️ Batch completed in {batch_time:.2f}s")
         
         # Small delay between batches to avoid rate limits
         if i + CONCURRENT_REQUESTS < len(products_to_check):
@@ -1520,15 +1658,17 @@ async def monitor_prices(context: ContextTypes.DEFAULT_TYPE):
     cycle_time = time.time() - cycle_start
     avg_time = total_api_time / checked if checked > 0 else 0
     
-    print(f"\n{'─'*70}")
-    print(f"✅ CYCLE COMPLETE:")
-    print(f"   • Products checked: {checked}/{len(products_to_check)}")
-    print(f"   • Price changes: {price_changes}")
-    print(f"   • Errors: {errors}")
-    print(f"   • Average time per product: {avg_time:.2f}s")
-    print(f"   • Total cycle time: {cycle_time:.2f}s")
-    print(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
-    print(f"{'='*70}\n")
+    logger.info(f"{'─'*70}")
+    logger.info(f"✅ CYCLE COMPLETE:")
+    logger.info(f"   • Products checked: {checked}/{len(products_to_check)}")
+    logger.info(f"   • Price changes: {price_changes}")
+    logger.info(f"   • Errors: {errors}")
+    logger.info(f"   • Average time per product: {avg_time:.2f}s")
+    logger.info(f"   • Total cycle time: {cycle_time:.2f}s")
+    if cycle_time > 0:
+        logger.info(f"   • Speed boost from concurrency: {(total_api_time/cycle_time):.1f}x")
+    logger.info(f"{'='*70}")
+
 
 async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """Send monthly reminder"""
@@ -1566,20 +1706,21 @@ async def send_monthly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
-        print(f"   ✅ Reminder sent to user {user_id}")
+        logger.info(f"✅ Reminder sent to user {user_id}")
     except Exception as e:
-        print(f"   ❌ Error sending reminder to user {user_id}: {e}")
+        logger.error(f"❌ Error sending reminder to user {user_id}: {e}")
+
 
 async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     """Check for users needing monthly reminder"""
-    print(f"\n🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"🔔 Checking monthly updates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     users_need_reminder = ExcelManager.get_users_needing_reminder()
     
     for user_id in users_need_reminder:
         products = ExcelManager.get_user_products(user_id)
         if products:
-            print(f"   📨 Scheduling reminder for user {user_id}")
+            logger.info(f"📨 Scheduling reminder for user {user_id}")
             context.job_queue.run_once(
                 send_monthly_reminder_job,
                 when=1,
@@ -1590,7 +1731,7 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
     users_past_deadline = ExcelManager.get_users_past_deadline()
     
     for user_id in users_past_deadline:
-        print(f"   🗑️ Cleaning up user {user_id} (no response)")
+        logger.info(f"🗑️ Cleaning up user {user_id} (no response)")
         
         try:
             await context.bot.send_message(
@@ -1603,36 +1744,85 @@ async def check_monthly_updates(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML'
             )
         except Exception as e:
-            print(f"   ❌ Error sending cleanup notification: {e}")
+            logger.error(f"❌ Error sending cleanup notification: {e}")
         
         ExcelManager.delete_all_user_data(user_id)
         ExcelManager.clear_update_reminder(user_id)
     
     if users_need_reminder:
-        print(f"   ✅ Sent {len(users_need_reminder)} reminder(s)")
+        logger.info(f"✅ Sent {len(users_need_reminder)} reminder(s)")
     if users_past_deadline:
-        print(f"   ✅ Cleaned up {len(users_past_deadline)} user(s)")
+        logger.info(f"✅ Cleaned up {len(users_past_deadline)} user(s)")
+
 
 # ============================================================================
-# MAIN FUNCTION
+# SIGNAL HANDLERS FOR UBUNTU
+# ============================================================================
+
+def handle_signal(signum, frame):
+    """Handle termination signals gracefully"""
+    logger.info(f"\n⛔ Received signal {signum}. Shutting down gracefully...")
+    sys.exit(0)
+
+
+async def cleanup():
+    """Cleanup function for graceful shutdown"""
+    global api_instance
+    logger.info("🧹 Cleaning up resources...")
+    
+    if api_instance:
+        try:
+            await api_instance.close_session()
+            logger.info("✅ API session closed")
+        except Exception as e:
+            logger.error(f"Error closing API session: {e}")
+    
+    logger.info("✅ Cleanup complete")
+
+
+# ============================================================================
+# MAIN FUNCTION - UBUNTU COMPATIBLE
 # ============================================================================
 
 def main():
-    """Start the bot"""
-    print(f"\n{'='*70}")
-    print("🤖 ALIEXPRESS PRICE MONITOR BOT - OPTIMIZED VERSION WITH TIMING")
-    print(f"{'='*70}")
-    print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
-    print(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
-    print(f"📦 Products per cycle: {PRODUCTS_PER_CYCLE}")
-    print(f"⏰ Request timeout: {REQUEST_TIMEOUT}s")
-    print(f"{'='*70}\n")
+    """Start the bot - Ubuntu compatible version"""
+    global api_instance
+    
+    # Setup Ubuntu environment
+    setup_ubuntu_environment()
+    
+    logger.info(f"{'='*70}")
+    logger.info("🤖 ALIEXPRESS PRICE MONITOR BOT - UBUNTU VERSION")
+    logger.info(f"{'='*70}")
+    logger.info(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"⚡ Concurrent requests: {CONCURRENT_REQUESTS}")
+    logger.info(f"⏱️  Monitoring interval: {MONITORING_INTERVAL//60} minutes")
+    logger.info(f"📦 Products per cycle: {PRODUCTS_PER_CYCLE}")
+    logger.info(f"⏰ Request timeout: {REQUEST_TIMEOUT}s")
+    logger.info(f"📁 Data directory: {SCRIPT_DIR}")
+    logger.info(f"{'='*70}")
 
-    ExcelManager.init_excel_files()
+    # Register signal handlers for Ubuntu
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    
+    # Try to register SIGHUP (Unix only)
+    try:
+        signal.signal(signal.SIGHUP, handle_signal)
+    except (AttributeError, ValueError):
+        pass  # SIGHUP not available on this platform
 
+    # Initialize Excel files
+    try:
+        ExcelManager.init_excel_files()
+    except Exception as e:
+        logger.error(f"Failed to initialize Excel files: {e}")
+        sys.exit(1)
+
+    # Build application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -1652,6 +1842,7 @@ def main():
         allow_reentry=True,
     )
 
+    # Add handlers
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(add_product_prompt, pattern="^add_product$"))
     application.add_handler(CallbackQueryHandler(view_my_products, pattern="^view_myproducts$"))
@@ -1667,6 +1858,7 @@ def main():
     application.add_handler(CommandHandler("myproducts", view_my_products))
     application.add_handler(CommandHandler("history", view_price_history))
 
+    # Setup job queue
     job_queue = application.job_queue
     
     job_queue.run_repeating(
@@ -1681,20 +1873,34 @@ def main():
         first=60
     )
 
-    print("✅ BOT STARTED SUCCESSFULLY!")
-    print(f"⌨️  Press Ctrl+C to stop.\n")
+    logger.info("✅ BOT STARTED SUCCESSFULLY!")
+    logger.info("⌨️  Press Ctrl+C to stop.")
+    logger.info("")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
+    # Run the bot
     try:
-        main()
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,  # Don't process old updates on restart
+            close_loop=False
+        )
     except KeyboardInterrupt:
-        print("\n⛔ Bot stopped by user")
+        logger.info("\n⛔ Bot stopped by user")
+    except Exception as e:
+        logger.error(f"\n❌ Fatal error: {e}")
+    finally:
         # Cleanup
         if api_instance:
-            asyncio.run(api_instance.close_session())
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        if api_instance:
-            asyncio.run(api_instance.close_session())
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(cleanup())
+                loop.close()
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+        
+        logger.info("👋 Goodbye!")
+
+
+if __name__ == '__main__':
+    main()
