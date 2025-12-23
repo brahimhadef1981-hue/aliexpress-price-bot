@@ -92,15 +92,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tesvqpljcuzoffpvdwkd.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_hBzaknlJAmuq9Y-PUVv7_A_je83HWoK") 
 
 # Validate configurations
-if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "8442641423:AAGRGoHQGb4Vptl_n_VogGpAUPC32hD8zZs":
     logger.error("❌ TELEGRAM_BOT_TOKEN is not set!")
     sys.exit(1)
 
-if not SUPABASE_URL or SUPABASE_URL == "YOUR_SUPABASE_URL":
+if not SUPABASE_URL or SUPABASE_URL == "https://tesvqpljcuzoffpvdwkd.supabase.co":
     logger.error("❌ SUPABASE_URL is not set!")
     sys.exit(1)
 
-if not SUPABASE_KEY or SUPABASE_KEY == "YOUR_SUPABASE_SERVICE_ROLE_KEY":
+if not SUPABASE_KEY or SUPABASE_KEY == "sb_publishable_hBzaknlJAmuq9Y-PUVv7_A_je83HWoK":
     logger.error("❌ SUPABASE_KEY is not set!")
     sys.exit(1)
 
@@ -1754,7 +1754,6 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
 
 
