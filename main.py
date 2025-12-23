@@ -88,7 +88,7 @@ ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz305
 ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "hadef")
 
 # Supabase Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL", "aws-1-eu-west-1.pooler.supabase.com")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://db.hbbtofkhbqbwmmtatsup.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "tesvqpljcuzoffpvdwkd")
 
 # Validate configurations
@@ -1754,6 +1754,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
