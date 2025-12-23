@@ -1,4 +1,0 @@
-python-telegram-bot[job-queue]==21.3
-aiohttp>=3.8.0
-certifi
-supabase>=2.0.0
