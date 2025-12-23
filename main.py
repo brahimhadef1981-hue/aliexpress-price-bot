@@ -82,7 +82,7 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8442641423:AAGRGoHQGb4Vptl_n_VogGpAUPC32hD8zZs")
 ALIEXPRESS_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY", "519492")
 ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk")
 ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "hadef")
@@ -1754,5 +1754,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
