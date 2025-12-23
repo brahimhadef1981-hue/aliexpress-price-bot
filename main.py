@@ -88,8 +88,8 @@ ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz305
 ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "hadef")
 
 # Supabase Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://db.hbbtofkhbqbwmmtatsup.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "hbbtofkhbqbwmmtatsup") 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tesvqpljcuzoffpvdwkd.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_hBzaknlJAmuq9Y-PUVv7_A_je83HWoK") 
 
 # Validate configurations
 if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -1754,6 +1754,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
