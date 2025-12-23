@@ -84,8 +84,8 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 # ============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ALIEXPRESS_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY", "YOUR_APP_KEY")
-ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "YOUR_APP_SECRET")
-ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "YOUR_TRACKING_ID")
+ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "R2Zl1pe2p47dFFjXz30546XTwu4JcFlk")
+ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "hadef")
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "aws-1-eu-west-1.pooler.supabase.com")
@@ -1754,3 +1754,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
